@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>封包示波器</title>
+<style>
+  :root {
+    --bg: #0c0f13;
+    --panel: #14181e;
+    --line: #2a3140;
+    --text: #d7dde6;
+    --muted: #8b97a8;
+    --green: #3ddc97;
+    --danger: #f87171;
+    --row: 32px;
+    --axis: 34px;
+    --channels: 20;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); }
+  body {
+    font: 13px/1.4 "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+    display: flex;
+    flex-direction: column;
+    min-height: 100%;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+    flex-wrap: wrap;
+  }
+  header h1 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 650;
+    letter-spacing: 0.04em;
+  }
+  header p {
+    margin: 0;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  select, button, input {
+    font: inherit;
+    color: var(--text);
+    background: #0e1318;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+  }
+  select, button { height: 28px; padding: 0 10px; }
+  button {
+    background: #12352a;
+    border-color: #1f6b4e;
+    color: var(--green);
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.5; cursor: wait; }
+  button.ghost {
+    background: transparent;
+    color: var(--muted);
+    border-color: var(--line);
+  }
+  #status { color: var(--muted); min-width: 8em; }
+  .scope {
+    display: grid;
+    grid-template-columns: minmax(300px, 420px) minmax(0, 1fr);
+    grid-template-rows: var(--axis) calc(var(--channels) * var(--row));
+    flex: 0 0 auto;
+  }
+  .corner {
+    border-bottom: 1px solid var(--line);
+    border-right: 1px solid var(--line);
+  }
+  #axis, #plot { display: block; width: 100%; height: 100%; background: #090c10; }
+  #axis { border-bottom: 1px solid var(--line); }
+  #channels { border-right: 1px solid var(--line); }
+  .ch {
+    height: var(--row);
+    display: grid;
+    grid-template-columns: 10px 42px minmax(0, 1fr);
+    gap: 8px;
+    align-items: center;
+    padding: 0 8px 0 10px;
+    border-bottom: 1px solid #1c222c;
+  }
+  .ch .swatch { width: 10px; height: 10px; border-radius: 2px; }
+  .ch .name { color: var(--muted); }
+  .ch input {
+    width: 100%;
+    height: 24px;
+    padding: 0 8px;
+    outline: none;
+  }
+  .ch input:focus { border-color: #4c9aff; }
+  .ch input.bad { border-color: var(--danger); color: #fecaca; }
+  #readout {
+    flex: 1;
+    min-height: 42px;
+    padding: 8px 14px 12px;
+    border-top: 1px solid var(--line);
+    color: var(--text);
+    background: #10141a;
+    white-space: pre-wrap;
+  }
+  #readout .dim { color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>封包示波器</h1>
+  <p>20 軌。每軌一條 Wireshark 顯示過濾，符合的封包會在該時間打出脈衝。</p>
+  <select id="file"></select>
+  <button id="reload" class="ghost" type="button">重新整理</button>
+  <button id="run" type="button">掃描</button>
+  <button id="full" class="ghost" type="button">全程</button>
+  <span id="status"></span>
+</header>
+<div class="scope">
+  <div class="corner"></div>
+  <canvas id="axis"></canvas>
+  <div id="channels"></div>
+  <canvas id="plot"></canvas>
+</div>
+<div id="readout"><span class="dim">滾輪縮放時間，拖曳平移，雙擊回到全程。在過濾欄按 Enter 掃描。</span></div>
+<script>
+const CHANNELS = 20;
+const ROW = 32;
+const COLORS = [
+  "#3ddc97", "#4c9aff", "#ffb020", "#ff5c7a", "#c084fc",
+  "#2ee6d6", "#f97316", "#a3e635", "#60a5fa", "#fb7185",
+  "#facc15", "#34d399", "#e879f9", "#38bdf8", "#fb923c",
+  "#a78bfa", "#4ade80", "#f472b6", "#22d3ee", "#fde047"
+];
+const HINTS = [
+  "dns", "tls", "arp", "mdns", "tcp.port == 443",
+  "udp", "icmpv6", "tcp", "ip.addr == 192.168.0.1", "http"
+];
+
+const fileSelect = document.getElementById("file");
+const statusEl = document.getElementById("status");
+const readout = document.getElementById("readout");
+const axisCanvas = document.getElementById("axis");
+const plotCanvas = document.getElementById("plot");
+const channelBox = document.getElementById("channels");
+
+const inputs = [];
+let meta = { duration: 1, packets: 0, file: "" };
+let view = { t0: 0, t1: 1 };
+let results = Array.from({ length: CHANNELS }, () => ({ error: null, events: [] }));
+let cursorT = null;
+let drag = null;
+
+function storageKey() { return "packet-scope:" + (fileSelect.value || ""); }
+
+function loadFilters() {
+  let saved = [];
+  try { saved = JSON.parse(localStorage.getItem(storageKey()) || "[]"); } catch (e) { saved = []; }
+  inputs.forEach((input, i) => { input.value = typeof saved[i] === "string" ? saved[i] : ""; });
+}
+
+function saveFilters() {
+  localStorage.setItem(storageKey(), JSON.stringify(inputs.map((input) => input.value)));
+}
+
+function buildRows() {
+  for (let i = 0; i < CHANNELS; i++) {
+    const row = document.createElement("div");
+    row.className = "ch";
+    const swatch = document.createElement("span");
+    swatch.className = "swatch";
+    swatch.style.background = COLORS[i];
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = "CH" + (i + 1);
+    const input = document.createElement("input");
+    input.spellcheck = false;
+    input.autocomplete = "off";
+    input.placeholder = HINTS[i] || "Wireshark 顯示過濾";
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") scan();
+    });
+    input.addEventListener("input", () => {
+      input.classList.remove("bad");
+      input.removeAttribute("title");
+    });
+    row.append(swatch, name, input);
+    channelBox.append(row);
+    inputs.push(input);
+  }
+}
+
+function setStatus(text) { statusEl.textContent = text; }
+
+async function refreshFiles(keep) {
+  const response = await fetch("/api/files");
+  const data = await response.json();
+  const previous = keep || fileSelect.value || localStorage.getItem("packet-scope-file") || "";
+  fileSelect.replaceChildren();
+  for (const name of data.files) {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = name;
+    fileSelect.append(option);
+  }
+  if (data.files.includes(previous)) fileSelect.value = previous;
+  if (!fileSelect.value) {
+    setStatus("資料夾裡沒有 pcap");
+    return;
+  }
+  localStorage.setItem("packet-scope-file", fileSelect.value);
+  loadFilters();
+  await loadMeta();
+}
+
+async function loadMeta() {
+  const response = await fetch("/api/meta?file=" + encodeURIComponent(fileSelect.value));
+  const data = await response.json();
+  if (!response.ok) {
+    setStatus(data.error || "無法讀取");
+    return;
+  }
+  meta = data;
+  view = { t0: 0, t1: data.duration };
+  cursorT = null;
+  results = Array.from({ length: CHANNELS }, () => ({ error: null, events: [] }));
+  draw();
+  setStatus("時間軸 0 – " + fmtTime(data.duration));
+  if (inputs.some((input) => input.value.trim())) scan();
+}
+
+async function scan() {
+  saveFilters();
+  const button = document.getElementById("run");
+  button.disabled = true;
+  setStatus("掃描中");
+  try {
+    const response = await fetch("/api/scan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        file: fileSelect.value,
+        filters: inputs.map((input) => input.value)
+      })
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      setStatus(data.error || "掃描失敗");
+      return;
+    }
+    meta.duration = data.duration;
+    meta.packets = data.packets;
+    if (view.t1 > data.duration) view.t1 = data.duration;
+    results = data.channels;
+    inputs.forEach((input, i) => {
+      const error = results[i] && results[i].error;
+      input.classList.toggle("bad", Boolean(error));
+      if (error) input.title = error;
+      else input.removeAttribute("title");
+    });
+    const bad = results.findIndex((channel) => channel.error);
+    setStatus(bad >= 0 ? "CH" + (bad + 1) + " 過濾無效" : "掃描完成");
+    draw();
+    paintReadout();
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function fmtTime(t) {
+  const sign = t < 0 ? "-" : "";
+  t = Math.abs(t);
+  if (t < 0.001) return sign + (t * 1e6).toFixed(0) + " µs";
+  if (t < 1) return sign + (t * 1000).toFixed(t < 0.01 ? 2 : 1) + " ms";
+  return sign + t.toFixed(t < 10 ? 3 : 2) + " s";
+}
+
+function plotWidth() { return plotCanvas.clientWidth; }
+function pad() { return { left: 8, right: 12 }; }
+
+function timeToX(t) {
+  const { left, right } = pad();
+  const width = Math.max(1, plotWidth() - left - right);
+  return left + ((t - view.t0) / Math.max(1e-12, view.t1 - view.t0)) * width;
+}
+
+function xToTime(x) {
+  const { left, right } = pad();
+  const width = Math.max(1, plotWidth() - left - right);
+  const ratio = (x - left) / width;
+  return view.t0 + ratio * (view.t1 - view.t0);
+}
+
+function fit(canvas) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  const bw = Math.max(1, Math.round(w * dpr));
+  const bh = Math.max(1, Math.round(h * dpr));
+  if (canvas.width !== bw || canvas.height !== bh) {
+    canvas.width = bw;
+    canvas.height = bh;
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w, h };
+}
+
+function niceStep(span) {
+  const target = span / 8;
+  if (!(target > 0)) return span || 1;
+  const pow = Math.pow(10, Math.floor(Math.log10(target)));
+  for (const mult of [1, 2, 5, 10]) {
+    if (mult * pow >= target * 0.75) return mult * pow;
+  }
+  return pow * 10;
+}
+
+function drawAxis() {
+  const { ctx, w, h } = fit(axisCanvas);
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#090c10";
+  ctx.fillRect(0, 0, w, h);
+  const step = niceStep(view.t1 - view.t0);
+  const start = Math.ceil(view.t0 / step) * step;
+  ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  for (let t = start; t <= view.t1 + step * 0.01; t += step) {
+    const x = timeToX(t);
+    if (x < 0 || x > w) continue;
+    ctx.strokeStyle = "#243044";
+    ctx.beginPath();
+    ctx.moveTo(x, h - 6);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+    ctx.fillStyle = "#8b97a8";
+    ctx.fillText(fmtTime(t), x, h / 2 - 2);
+  }
+}
+
+function drawPlot() {
+  const { ctx, w, h } = fit(plotCanvas);
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#090c10";
+  ctx.fillRect(0, 0, w, h);
+
+  const step = niceStep(view.t1 - view.t0);
+  const start = Math.ceil(view.t0 / step) * step;
+  for (let t = start; t <= view.t1 + step * 0.01; t += step) {
+    const x = timeToX(t);
+    ctx.strokeStyle = "#18202b";
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+  }
+
+  for (let i = 0; i < CHANNELS; i++) {
+    const y0 = i * ROW;
+    if (i % 2 === 1) {
+      ctx.fillStyle = "rgba(255,255,255,0.015)";
+      ctx.fillRect(0, y0, w, ROW);
+    }
+    const channel = results[i] || { events: [], error: null };
+    const active = inputs[i].value.trim().length > 0;
+    const yBase = y0 + ROW - 7;
+    const yTop = y0 + 6;
+    ctx.strokeStyle = channel.error ? "#f87171" : (active ? COLORS[i] : "#3a4454");
+    ctx.globalAlpha = active ? 0.55 : 0.8;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, yBase + 0.5);
+    ctx.lineTo(w, yBase + 0.5);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    if (!active || channel.error) continue;
+
+    ctx.strokeStyle = COLORS[i];
+    ctx.shadowColor = COLORS[i];
+    ctx.shadowBlur = 8;
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    const seen = new Set();
+    for (const event of channel.events) {
+      if (event.t < view.t0 || event.t > view.t1) continue;
+      const x = Math.round(timeToX(event.t));
+      if (seen.has(x)) continue;
+      seen.add(x);
+      ctx.moveTo(x + 0.5, yBase);
+      ctx.lineTo(x + 0.5, yTop);
+    }
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+
+  if (cursorT != null && cursorT >= view.t0 && cursorT <= view.t1) {
+    const x = timeToX(cursorT);
+    ctx.strokeStyle = "rgba(255,255,255,0.45)";
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+
+function hitsAt(time) {
+  const span = view.t1 - view.t0;
+  const px = 4;
+  const windowTime = (px / Math.max(1, plotWidth())) * span;
+  const hits = [];
+  results.forEach((channel, i) => {
+    if (!channel || channel.error || !inputs[i].value.trim()) return;
+    let best = null;
+    let bestDt = windowTime;
+    for (const event of channel.events) {
+      const dt = Math.abs(event.t - time);
+      if (dt <= bestDt) {
+        best = event;
+        bestDt = dt;
+      }
+    }
+    if (best) hits.push({ channel: i + 1, color: COLORS[i], event: best });
+  });
+  return hits;
+}
+
+function paintReadout() {
+  if (cursorT == null) {
+    readout.innerHTML = '<span class="dim">滾輪縮放時間，拖曳平移，雙擊回到全程。在過濾欄按 Enter 掃描。</span>';
+    return;
+  }
+  const hits = hitsAt(cursorT);
+  const head = '<span class="dim">游標 </span>' + fmtTime(cursorT);
+  if (!hits.length) {
+    readout.innerHTML = head + '   <span class="dim">此時間沒有脈衝</span>';
+    return;
+  }
+  const lines = hits.slice(0, 6).map((hit) => {
+    const ev = hit.event;
+    const text = "CH" + hit.channel + "  #" + ev.n + "  " + (ev.proto || "") + "  " + (ev.info || "");
+    return '<span style="color:' + hit.color + '">' + escapeHtml(text) + "</span>";
+  });
+  const extra = hits.length > 6 ? ' <span class="dim">+' + (hits.length - 6) + "</span>" : "";
+  readout.innerHTML = head + "<br>" + lines.join("<br>") + extra;
+}
+
+function escapeHtml(text) {
+  return text.replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
+}
+
+function draw() {
+  drawAxis();
+  drawPlot();
+}
+
+function resetView() {
+  view = { t0: 0, t1: meta.duration || 1 };
+  draw();
+  paintReadout();
+}
+
+function zoomAt(x, factor) {
+  const focus = xToTime(x);
+  const span = (view.t1 - view.t0) * factor;
+  const minSpan = 20e-6;
+  const full = meta.duration || 1;
+  const next = Math.min(full, Math.max(minSpan, span));
+  const ratio = (focus - view.t0) / Math.max(1e-12, view.t1 - view.t0);
+  let t0 = focus - ratio * next;
+  let t1 = t0 + next;
+  if (t0 < 0) { t1 -= t0; t0 = 0; }
+  if (t1 > full) { t0 -= t1 - full; t1 = full; }
+  if (t0 < 0) t0 = 0;
+  view = { t0, t1 };
+  draw();
+  paintReadout();
+}
+
+plotCanvas.addEventListener("wheel", (event) => {
+  event.preventDefault();
+  const rect = plotCanvas.getBoundingClientRect();
+  const factor = event.deltaY > 0 ? 1.18 : 1 / 1.18;
+  zoomAt(event.clientX - rect.left, factor);
+}, { passive: false });
+
+plotCanvas.addEventListener("pointerdown", (event) => {
+  plotCanvas.setPointerCapture(event.pointerId);
+  drag = { x: event.clientX, t0: view.t0, t1: view.t1 };
+});
+plotCanvas.addEventListener("pointermove", (event) => {
+  const rect = plotCanvas.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  if (drag) {
+    const span = drag.t1 - drag.t0;
+    const dx = event.clientX - drag.x;
+    const dt = (dx / Math.max(1, plotWidth())) * span;
+    let t0 = drag.t0 - dt;
+    let t1 = drag.t1 - dt;
+    const full = meta.duration || 1;
+    if (t0 < 0) { t1 -= t0; t0 = 0; }
+    if (t1 > full) { t0 -= t1 - full; t1 = full; }
+    if (t0 < 0) t0 = 0;
+    view = { t0, t1 };
+  }
+  cursorT = Math.min(view.t1, Math.max(view.t0, xToTime(x)));
+  draw();
+  paintReadout();
+});
+function endDrag(event) {
+  if (drag && plotCanvas.hasPointerCapture(event.pointerId)) {
+    plotCanvas.releasePointerCapture(event.pointerId);
+  }
+  drag = null;
+}
+plotCanvas.addEventListener("pointerup", endDrag);
+plotCanvas.addEventListener("pointercancel", endDrag);
+plotCanvas.addEventListener("dblclick", resetView);
+plotCanvas.addEventListener("pointerleave", () => {
+  if (drag) return;
+  cursorT = null;
+  draw();
+  paintReadout();
+});
+
+document.getElementById("run").addEventListener("click", scan);
+document.getElementById("full").addEventListener("click", resetView);
+document.getElementById("reload").addEventListener("click", () => refreshFiles(fileSelect.value));
+fileSelect.addEventListener("change", () => {
+  localStorage.setItem("packet-scope-file", fileSelect.value);
+  loadFilters();
+  loadMeta();
+});
+window.addEventListener("resize", draw);
+
+buildRows();
+refreshFiles();
+</script>
+</body>
+</html>
