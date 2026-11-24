@@ -317,7 +317,7 @@ function fmtTime(t) {
   t = Math.abs(t);
   if (t < 0.001) return sign + (t * 1e6).toFixed(0) + " µs";
   if (t < 1) return sign + (t * 1000).toFixed(t < 0.01 ? 2 : 1) + " ms";
-  return sign + t.toFixed(t < 10 ? 3 : 2) + " s";
+  return sign + t.toFixed(4) + " s";
 }
 
 function fmtFreq(dt) {
