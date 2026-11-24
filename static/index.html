@@ -108,6 +108,25 @@
     white-space: pre-wrap;
   }
   #readout .dim { color: var(--muted); }
+  button.measure-on {
+    background: #1d4ed8;
+    border-color: #3b82f6;
+    color: #fff;
+  }
+  #la-measure-tooltip {
+    position: fixed;
+    z-index: 9999;
+    pointer-events: none;
+    display: none;
+    background: rgba(15, 23, 42, 0.96);
+    border: 1px solid #38bdf8;
+    border-radius: 6px;
+    padding: 8px 10px;
+    color: #e2e8f0;
+    font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    max-width: 420px;
+  }
 </style>
 </head>
 <body>
@@ -118,6 +137,8 @@
   <button id="reload" class="ghost" type="button">重新整理</button>
   <button id="run" type="button">掃描</button>
   <button id="full" class="ghost" type="button">全程</button>
+  <button id="la-measure-btn" class="ghost" type="button" title="開啟後拖曳建立時間測量區塊（平時亦可按住 Shift+拖曳）">📏 測量</button>
+  <button id="la-clear-measures" class="ghost" type="button" disabled>清除測量</button>
   <span id="status"></span>
 </header>
 <div class="scope">
@@ -126,7 +147,8 @@
   <div id="channels"></div>
   <canvas id="plot"></canvas>
 </div>
-<div id="readout"><span class="dim">滾輪縮放時間，拖曳平移，雙擊回到全程。在過濾欄按 Enter 掃描。</span></div>
+<div id="readout"><span class="dim">滾輪縮放時間，拖曳平移，雙擊回到全程。開啟「測量」或按住 Shift 拖曳可新增多組時間測量，滑鼠移至測量區塊顯示統計，右鍵或點 × 可刪除。在過濾欄按 Enter 掃描。</span></div>
+<div id="la-measure-tooltip"></div>
 <script>
 const CHANNELS = 20;
 const ROW = 32;
@@ -148,12 +170,23 @@ const axisCanvas = document.getElementById("axis");
 const plotCanvas = document.getElementById("plot");
 const channelBox = document.getElementById("channels");
 
+const laMeasureBtn = document.getElementById("la-measure-btn");
+const laClearMeasuresBtn = document.getElementById("la-clear-measures");
+const laMeasureTooltip = document.getElementById("la-measure-tooltip");
+
+const MEASURE_COLORS = ["#38bdf8", "#f59e0b", "#10b981", "#ec4899", "#a855f7", "#fb923c"];
+
 const inputs = [];
 let meta = { duration: 1, packets: 0, file: "" };
 let view = { t0: 0, t1: 1 };
 let results = Array.from({ length: CHANNELS }, () => ({ error: null, events: [] }));
 let cursorT = null;
 let drag = null;
+let measureMode = false;
+let measures = [];
+let nextMeasureId = 1;
+let measureDrag = null;
+let hoveredMeasureId = null;
 
 function storageKey() { return "packet-scope:" + (fileSelect.value || ""); }
 
@@ -224,9 +257,17 @@ async function loadMeta() {
     setStatus(data.error || "無法讀取");
     return;
   }
+  const fileChanged = meta.file !== data.file;
   meta = data;
   view = { t0: 0, t1: data.duration };
   cursorT = null;
+  if (fileChanged) {
+    measures = [];
+    nextMeasureId = 1;
+    hoveredMeasureId = null;
+    hideLaMeasureTooltip();
+    updateMeasureButtons();
+  }
   results = Array.from({ length: CHANNELS }, () => ({ error: null, events: [] }));
   draw();
   setStatus("時間軸 0 – " + fmtTime(data.duration));
@@ -279,6 +320,115 @@ function fmtTime(t) {
   return sign + t.toFixed(t < 10 ? 3 : 2) + " s";
 }
 
+function fmtFreq(dt) {
+  if (!(dt > 0)) return "-";
+  const hz = 1 / dt;
+  if (hz >= 1e6) return (hz / 1e6).toFixed(3) + " MHz";
+  if (hz >= 1e3) return (hz / 1e3).toFixed(2) + " kHz";
+  return hz.toFixed(hz < 10 ? 2 : 1) + " Hz";
+}
+
+function updateMeasureButtons() {
+  laMeasureBtn.classList.toggle("measure-on", measureMode);
+  plotCanvas.style.cursor = measureMode ? "col-resize" : "";
+  laClearMeasuresBtn.textContent = measures.length ? "清除測量 (" + measures.length + ")" : "清除測量";
+  laClearMeasuresBtn.disabled = measures.length === 0;
+}
+
+function measurePillRect(m) {
+  const x0 = timeToX(m.t0);
+  const x1 = timeToX(m.t1);
+  const x = Math.max(0, Math.min(plotWidth() - 52, Math.min(x0, x1) + 2));
+  const y = 2;
+  const w = 48;
+  const h = 16;
+  return { x, y, w, h, closeX0: x + 32, closeX1: x + 48, showClose: true };
+}
+
+function findMeasureAt(x, y) {
+  let best = null;
+  let bestSpan = Infinity;
+  let hitClose = false;
+  for (const m of measures) {
+    const pill = measurePillRect(m);
+    const onPill = x >= pill.x && x <= pill.x + pill.w && y >= pill.y && y <= pill.y + pill.h;
+    const onClose = onPill && x >= pill.closeX0 && x <= pill.closeX1;
+    const x0 = Math.min(timeToX(m.t0), timeToX(m.t1));
+    const x1 = Math.max(timeToX(m.t0), timeToX(m.t1));
+    const insideBand = (x >= x0 - 2 && x <= x1 + 2) || onPill;
+    if (!insideBand) continue;
+    const span = Math.abs(m.t1 - m.t0);
+    if (onClose && !hitClose) {
+      best = m;
+      bestSpan = span;
+      hitClose = true;
+    } else if (onClose === hitClose && span < bestSpan) {
+      best = m;
+      bestSpan = span;
+    }
+  }
+  if (!best) return null;
+  return { measure: best, isClose: hitClose };
+}
+
+function computeLogicMeasureStats(m) {
+  const t0 = m.t0;
+  const t1 = m.t1;
+  const dt = Math.max(0, t1 - t0);
+  let totalEvents = 0;
+  const perChannel = [];
+  for (let i = 0; i < CHANNELS; i++) {
+    if (!inputs[i].value.trim()) continue;
+    const ch = results[i];
+    if (!ch || ch.error || !ch.events) continue;
+    const evs = ch.events.filter((ev) => ev.t >= t0 && ev.t <= t1);
+    if (evs.length > 0) {
+      totalEvents += evs.length;
+      let avgPeriod = null;
+      let freq = "-";
+      if (evs.length >= 2) {
+        avgPeriod = (evs[evs.length - 1].t - evs[0].t) / (evs.length - 1);
+        freq = fmtFreq(avgPeriod);
+      }
+      perChannel.push({
+        channel: i + 1,
+        color: COLORS[i],
+        count: evs.length,
+        avgPeriod,
+        freq,
+      });
+    }
+  }
+  return { dt, freq: fmtFreq(dt), totalEvents, perChannel };
+}
+
+function hideLaMeasureTooltip() {
+  laMeasureTooltip.style.display = "none";
+}
+
+function showLaMeasureTooltip(m, clientX, clientY) {
+  const stats = computeLogicMeasureStats(m);
+  const rows = stats.perChannel.slice(0, 8).map((c) => {
+    const periodInfo = c.avgPeriod != null ? " | 均週期 " + fmtTime(c.avgPeriod) + " (" + c.freq + ")" : "";
+    return '<div style="color:' + c.color + '">CH' + c.channel + ": " + c.count + " 次" + periodInfo + "</div>";
+  }).join("");
+  const extra = stats.perChannel.length > 8 ? '<div style="color:#94a3b8;">+' + (stats.perChannel.length - 8) + " 軌</div>" : "";
+  laMeasureTooltip.innerHTML =
+    '<div style="font-weight:700;color:' + m.color + ';margin-bottom:4px;">測量 M' + m.id + ' <span style="color:#94a3b8;font-weight:400;">(右鍵或點 × 刪除)</span></div>' +
+    "<div>T1: " + fmtTime(m.t0) + "  |  T2: " + fmtTime(m.t1) + "</div>" +
+    '<div style="color:#f8fafc;font-weight:600;margin-bottom:4px;">ΔT: ' + fmtTime(stats.dt) + "  |  1/ΔT: " + stats.freq + "  |  總計: " + stats.totalEvents + " 次</div>" +
+    (rows || '<div style="color:#94a3b8;">區間內無符合事件</div>') +
+    extra;
+  laMeasureTooltip.style.display = "block";
+  const rect = laMeasureTooltip.getBoundingClientRect();
+  let left = clientX + 14;
+  let top = clientY + 14;
+  if (left + rect.width > window.innerWidth - 8) left = Math.max(8, clientX - rect.width - 14);
+  if (top + rect.height > window.innerHeight - 8) top = Math.max(8, clientY - rect.height - 14);
+  laMeasureTooltip.style.left = left + "px";
+  laMeasureTooltip.style.top = top + "px";
+}
+
 function plotWidth() { return plotCanvas.clientWidth; }
 function pad() { return { left: 8, right: 12 }; }
 
@@ -325,6 +475,13 @@ function drawAxis() {
   ctx.clearRect(0, 0, w, h);
   ctx.fillStyle = "#090c10";
   ctx.fillRect(0, 0, w, h);
+  for (const m of measures) {
+    if (m.t1 < view.t0 || m.t0 > view.t1) continue;
+    const x0 = Math.max(0, timeToX(m.t0));
+    const x1 = Math.min(w, timeToX(m.t1));
+    ctx.fillStyle = m.color;
+    ctx.fillRect(x0, 0, Math.max(2, x1 - x0), 3);
+  }
   const step = niceStep(view.t1 - view.t0);
   const start = Math.ceil(view.t0 / step) * step;
   ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
@@ -398,6 +555,65 @@ function drawPlot() {
     ctx.shadowBlur = 0;
   }
 
+  const drawBand = (t0, t1, color, label, isHovered, pillRect) => {
+    if (t1 < view.t0 || t0 > view.t1) return;
+    const rawX0 = timeToX(t0);
+    const rawX1 = timeToX(t1);
+    const left = Math.max(0, Math.min(rawX0, rawX1));
+    const right = Math.min(w, Math.max(rawX0, rawX1));
+    const bandW = Math.max(1, right - left);
+
+    ctx.save();
+    ctx.fillStyle = color;
+    ctx.globalAlpha = isHovered ? 0.24 : 0.14;
+    ctx.fillRect(left, 0, bandW, h);
+
+    ctx.globalAlpha = isHovered ? 0.95 : 0.8;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = isHovered ? 2 : 1.2;
+    if (rawX0 >= 0 && rawX0 <= w) {
+      ctx.beginPath();
+      ctx.moveTo(rawX0 + 0.5, 0);
+      ctx.lineTo(rawX0 + 0.5, h);
+      ctx.stroke();
+    }
+    if (rawX1 >= 0 && rawX1 <= w) {
+      ctx.beginPath();
+      ctx.moveTo(rawX1 + 0.5, 0);
+      ctx.lineTo(rawX1 + 0.5, h);
+      ctx.stroke();
+    }
+
+    if (pillRect) {
+      ctx.globalAlpha = 0.92;
+      ctx.fillStyle = "#0f172a";
+      ctx.fillRect(pillRect.x, pillRect.y, pillRect.w, pillRect.h);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(pillRect.x + 0.5, pillRect.y + 0.5, pillRect.w - 1, pillRect.h - 1);
+      ctx.fillStyle = color;
+      ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      ctx.fillText(label, pillRect.x + 5, pillRect.y + pillRect.h / 2 + 0.5);
+      if (pillRect.showClose) {
+        ctx.fillStyle = "#94a3b8";
+        ctx.fillText("×", pillRect.closeX0 + 3, pillRect.y + pillRect.h / 2 + 0.5);
+      }
+    }
+    ctx.restore();
+  };
+
+  for (const m of measures) {
+    drawBand(m.t0, m.t1, m.color, "M" + m.id, m.id === hoveredMeasureId, measurePillRect(m));
+  }
+  if (measureDrag) {
+    const pt0 = Math.min(measureDrag.startT, measureDrag.currT);
+    const pt1 = Math.max(measureDrag.startT, measureDrag.currT);
+    const px = Math.max(0, Math.min(w - 30, timeToX(pt0) + 2));
+    drawBand(pt0, pt1, "#38bdf8", "M?", true, { x: px, y: 2, w: 28, h: 16, showClose: false });
+  }
+
   if (cursorT != null && cursorT >= view.t0 && cursorT <= view.t1) {
     const x = timeToX(cursorT);
     ctx.strokeStyle = "rgba(255,255,255,0.45)";
@@ -433,7 +649,7 @@ function hitsAt(time) {
 
 function paintReadout() {
   if (cursorT == null) {
-    readout.innerHTML = '<span class="dim">滾輪縮放時間，拖曳平移，雙擊回到全程。在過濾欄按 Enter 掃描。</span>';
+    readout.innerHTML = '<span class="dim">滾輪縮放時間，拖曳平移，雙擊回到全程。開啟「測量」或按住 Shift 拖曳可新增多組時間測量，滑鼠移至測量區塊顯示統計，右鍵或點 × 可刪除。在過濾欄按 Enter 掃描。</span>';
     return;
   }
   const hits = hitsAt(cursorT);
@@ -491,12 +707,40 @@ plotCanvas.addEventListener("wheel", (event) => {
 }, { passive: false });
 
 plotCanvas.addEventListener("pointerdown", (event) => {
+  if (event.button !== 0) return;
+  const rect = plotCanvas.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  const hit = findMeasureAt(x, y);
+  if (hit && hit.isClose) {
+    measures = measures.filter((m) => m.id !== hit.measure.id);
+    if (hoveredMeasureId === hit.measure.id) hoveredMeasureId = null;
+    hideLaMeasureTooltip();
+    updateMeasureButtons();
+    draw();
+    return;
+  }
   plotCanvas.setPointerCapture(event.pointerId);
-  drag = { x: event.clientX, t0: view.t0, t1: view.t1 };
+  hideLaMeasureTooltip();
+  if (measureMode || event.shiftKey) {
+    const t = Math.min(view.t1, Math.max(view.t0, xToTime(x)));
+    measureDrag = { startX: x, startT: t, currT: t };
+    draw();
+  } else {
+    drag = { x: event.clientX, t0: view.t0, t1: view.t1 };
+  }
 });
 plotCanvas.addEventListener("pointermove", (event) => {
   const rect = plotCanvas.getBoundingClientRect();
   const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  if (measureDrag) {
+    measureDrag.currT = Math.min(view.t1, Math.max(view.t0, xToTime(x)));
+    cursorT = measureDrag.currT;
+    draw();
+    paintReadout();
+    return;
+  }
   if (drag) {
     const span = drag.t1 - drag.t0;
     const dx = event.clientX - drag.x;
@@ -508,12 +752,44 @@ plotCanvas.addEventListener("pointermove", (event) => {
     if (t1 > full) { t0 -= t1 - full; t1 = full; }
     if (t0 < 0) t0 = 0;
     view = { t0, t1 };
+    hideLaMeasureTooltip();
+    cursorT = Math.min(view.t1, Math.max(view.t0, xToTime(x)));
+    draw();
+    paintReadout();
+    return;
   }
   cursorT = Math.min(view.t1, Math.max(view.t0, xToTime(x)));
+  const hit = findMeasureAt(x, y);
+  hoveredMeasureId = hit ? hit.measure.id : null;
+  if (hit) {
+    showLaMeasureTooltip(hit.measure, event.clientX, event.clientY);
+  } else {
+    hideLaMeasureTooltip();
+  }
+  plotCanvas.style.cursor = hit && hit.isClose ? "pointer" : (measureMode ? "col-resize" : "");
   draw();
   paintReadout();
 });
 function endDrag(event) {
+  if (measureDrag) {
+    if (plotCanvas.hasPointerCapture(event.pointerId)) {
+      plotCanvas.releasePointerCapture(event.pointerId);
+    }
+    const pxSpan = Math.abs(timeToX(measureDrag.currT) - timeToX(measureDrag.startT));
+    if (pxSpan >= 4) {
+      const id = nextMeasureId++;
+      measures.push({
+        id,
+        t0: Math.min(measureDrag.startT, measureDrag.currT),
+        t1: Math.max(measureDrag.startT, measureDrag.currT),
+        color: MEASURE_COLORS[(id - 1) % MEASURE_COLORS.length],
+      });
+      updateMeasureButtons();
+    }
+    measureDrag = null;
+    draw();
+    return;
+  }
   if (drag && plotCanvas.hasPointerCapture(event.pointerId)) {
     plotCanvas.releasePointerCapture(event.pointerId);
   }
@@ -522,13 +798,40 @@ function endDrag(event) {
 plotCanvas.addEventListener("pointerup", endDrag);
 plotCanvas.addEventListener("pointercancel", endDrag);
 plotCanvas.addEventListener("dblclick", resetView);
+plotCanvas.addEventListener("contextmenu", (event) => {
+  const rect = plotCanvas.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  const hit = findMeasureAt(x, y);
+  if (!hit) return;
+  event.preventDefault();
+  measures = measures.filter((m) => m.id !== hit.measure.id);
+  if (hoveredMeasureId === hit.measure.id) hoveredMeasureId = null;
+  hideLaMeasureTooltip();
+  updateMeasureButtons();
+  draw();
+});
 plotCanvas.addEventListener("pointerleave", () => {
-  if (drag) return;
+  if (drag || measureDrag) return;
   cursorT = null;
+  hoveredMeasureId = null;
+  hideLaMeasureTooltip();
+  plotCanvas.style.cursor = measureMode ? "col-resize" : "";
   draw();
   paintReadout();
 });
 
+laMeasureBtn.addEventListener("click", () => {
+  measureMode = !measureMode;
+  updateMeasureButtons();
+});
+laClearMeasuresBtn.addEventListener("click", () => {
+  measures = [];
+  hoveredMeasureId = null;
+  hideLaMeasureTooltip();
+  updateMeasureButtons();
+  draw();
+});
 document.getElementById("run").addEventListener("click", scan);
 document.getElementById("full").addEventListener("click", resetView);
 document.getElementById("reload").addEventListener("click", () => refreshFiles(fileSelect.value));

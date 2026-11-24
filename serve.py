@@ -662,12 +662,24 @@ LIVE_UI_INJECTION = """
 
 <!-- 浮動數值波形檢視視窗：自動為所有 PDO 頻道繪製真實 Y 軸數值階梯曲線 -->
 <div id="pdo-scope-dock" style="display:none;background:#0b1120;color:#e2e8f0;padding:12px 16px;border-bottom:2px solid #0284c7;font-family:system-ui,sans-serif;">
-  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+  <div style="display:flex;align-items:center;gap:8px;justify-content:space-between;margin-bottom:8px;flex-wrap:wrap;">
     <strong style="color:#38bdf8;font-size:14px;">📊 EtherCAT PDO 數值波形示波器 (Y軸：實際工程數值 / X軸：相對時間)</strong>
-    <span id="pdo-cursor-readout" style="font-family:monospace;font-size:13px;color:#fbbf24;">將滑鼠移至下方波形上可檢視精確時間與數值</span>
+    <div style="display:flex;align-items:center;gap:6px;">
+      <button id="pdo-full-btn" type="button" style="background:#1e293b;color:#e2e8f0;border:1px solid #475569;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:12px;">全程</button>
+      <button id="pdo-measure-btn" type="button" title="開啟後拖曳建立時間測量區塊（平時亦可按住 Shift+拖曳）" style="background:#1e293b;color:#e2e8f0;border:1px solid #475569;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:12px;">📏 測量</button>
+      <button id="pdo-clear-measures" type="button" disabled style="background:#1e293b;color:#94a3b8;border:1px solid #334155;padding:3px 10px;border-radius:4px;cursor:not-allowed;font-size:12px;">清除測量</button>
+    </div>
+    <span id="pdo-cursor-readout" style="font-family:monospace;font-size:13px;color:#fbbf24;">滾輪縮放時間，拖曳平移，雙擊回到全程；開啟「測量」或 Shift+拖曳新增多組測量，滑鼠移至測量區塊顯示統計，右鍵或點 × 刪除</span>
+  </div>
+  <div id="pdo-axis-row" style="display:flex;align-items:stretch;background:#0f172a;border:1px solid #1e293b;border-radius:6px 6px 0 0;margin-bottom:6px;overflow:hidden;height:26px;">
+    <div style="width:215px;flex-shrink:0;padding:0 10px;border-right:1px solid #1e293b;display:flex;align-items:center;font-size:11px;color:#94a3b8;background:#131c31;">時間軸</div>
+    <div id="pdo-axis-wrap" style="flex:1;position:relative;cursor:ew-resize;">
+      <canvas id="pdo-axis" style="width:100%;height:26px;display:block;"></canvas>
+    </div>
   </div>
   <div id="pdo-waveforms-container" style="display:flex;flex-direction:column;gap:8px;max-height:460px;overflow-y:auto;"></div>
 </div>
+<div id="pdo-measure-tooltip" style="position:fixed;z-index:9999;pointer-events:none;display:none;background:rgba(15,23,42,0.96);border:1px solid #38bdf8;border-radius:6px;padding:8px 10px;color:#e2e8f0;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;box-shadow:0 8px 24px rgba(0,0,0,0.45);max-width:440px;"></div>
 
 <script>
 (function() {
@@ -688,12 +700,34 @@ LIVE_UI_INJECTION = """
   const pdoPreview = document.getElementById('pdo-preview');
 
   const scopeDock = document.getElementById('pdo-scope-dock');
+  const pdoFullBtn = document.getElementById('pdo-full-btn');
+  const pdoMeasureBtn = document.getElementById('pdo-measure-btn');
+  const pdoClearMeasuresBtn = document.getElementById('pdo-clear-measures');
+  const pdoAxisWrap = document.getElementById('pdo-axis-wrap');
+  const pdoAxisCanvas = document.getElementById('pdo-axis');
   const waveformsContainer = document.getElementById('pdo-waveforms-container');
   const cursorReadout = document.getElementById('pdo-cursor-readout');
+  const pdoMeasureTooltip = document.getElementById('pdo-measure-tooltip');
 
   let pollTimer = null;
   let isLive = false;
   let latestScanData = null;
+
+  const PDO_DEFAULT_HINT = '滾輪縮放時間，拖曳平移，雙擊回到全程；開啟「測量」或 Shift+拖曳新增多組測量，滑鼠移至測量區塊顯示統計，右鍵或點 × 刪除';
+  const PDO_MEASURE_COLORS = ['#38bdf8', '#f59e0b', '#10b981', '#ec4899', '#a855f7', '#fb923c'];
+  const PDO_PAD = { left: 8, right: 12 };
+
+  let pdoDuration = 1;
+  let pdoFile = '';
+  let pdoView = { t0: 0, t1: 1 };
+  let pdoCursorT = null;
+  let pdoMeasureMode = false;
+  let pdoMeasures = [];
+  let pdoNextMeasureId = 1;
+  let pdoDrag = null;
+  let pdoMeasureDrag = null;
+  let pdoHoveredMeasure = null;
+  let pdoRowModels = [];
 
   const CHANNEL_COLORS = [
     '#38bdf8', '#4ade80', '#facc15', '#f472b6', '#a78bfa',
@@ -719,7 +753,7 @@ LIVE_UI_INJECTION = """
   };
 
   window.addEventListener('resize', () => {
-    if (latestScanData) renderPdoWaveforms(latestScanData);
+    if (pdoRowModels.length > 0) drawPdoAll();
   });
 
   function formatAxisNum(num, dtype) {
@@ -728,16 +762,515 @@ LIVE_UI_INJECTION = """
     return num.toFixed(2);
   }
 
+  function pdoFmtTime(t) {
+    const sign = t < 0 ? '-' : '';
+    t = Math.abs(t);
+    if (t < 0.001) return sign + (t * 1e6).toFixed(0) + ' µs';
+    if (t < 1) return sign + (t * 1000).toFixed(t < 0.01 ? 2 : 1) + ' ms';
+    return sign + t.toFixed(t < 10 ? 3 : 2) + ' s';
+  }
+
+  function pdoFmtFreq(dt) {
+    if (!(dt > 0)) return '-';
+    const hz = 1 / dt;
+    if (hz >= 1e6) return (hz / 1e6).toFixed(3) + ' MHz';
+    if (hz >= 1e3) return (hz / 1e3).toFixed(2) + ' kHz';
+    return hz.toFixed(hz < 10 ? 2 : 1) + ' Hz';
+  }
+
+  function pdoNiceStep(span) {
+    const target = span / 8;
+    if (!(target > 0)) return span || 1;
+    const pow = Math.pow(10, Math.floor(Math.log10(target)));
+    for (const mult of [1, 2, 5, 10]) {
+      if (mult * pow >= target * 0.75) return mult * pow;
+    }
+    return pow * 10;
+  }
+
+  function pdoTimeToX(t, w) {
+    const plotW = Math.max(1, w - PDO_PAD.left - PDO_PAD.right);
+    const span = Math.max(1e-12, pdoView.t1 - pdoView.t0);
+    return PDO_PAD.left + ((t - pdoView.t0) / span) * plotW;
+  }
+
+  function pdoXToTime(x, w) {
+    const plotW = Math.max(1, w - PDO_PAD.left - PDO_PAD.right);
+    const ratio = (x - PDO_PAD.left) / plotW;
+    return pdoView.t0 + ratio * (pdoView.t1 - pdoView.t0);
+  }
+
+  function updatePdoMeasureButtons() {
+    if (pdoMeasureMode) {
+      pdoMeasureBtn.style.background = '#1d4ed8';
+      pdoMeasureBtn.style.borderColor = '#3b82f6';
+      pdoMeasureBtn.style.color = '#ffffff';
+    } else {
+      pdoMeasureBtn.style.background = '#1e293b';
+      pdoMeasureBtn.style.borderColor = '#475569';
+      pdoMeasureBtn.style.color = '#e2e8f0';
+    }
+    pdoClearMeasuresBtn.textContent = pdoMeasures.length ? `清除測量 (${pdoMeasures.length})` : '清除測量';
+    pdoClearMeasuresBtn.disabled = pdoMeasures.length === 0;
+    pdoClearMeasuresBtn.style.color = pdoMeasures.length ? '#e2e8f0' : '#94a3b8';
+    pdoClearMeasuresBtn.style.borderColor = pdoMeasures.length ? '#475569' : '#334155';
+    pdoClearMeasuresBtn.style.cursor = pdoMeasures.length ? 'pointer' : 'not-allowed';
+    pdoRowModels.forEach(row => {
+      row.canvasWrap.style.cursor = pdoMeasureMode ? 'col-resize' : 'crosshair';
+    });
+  }
+
+  function pdoResetView() {
+    pdoView = { t0: 0, t1: Math.max(pdoDuration || 1e-6, 1e-6) };
+    drawPdoAll();
+  }
+
+  function pdoZoomAt(x, w, factor) {
+    const focus = pdoXToTime(x, w);
+    const span = (pdoView.t1 - pdoView.t0) * factor;
+    const minSpan = 20e-6;
+    const full = Math.max(pdoDuration || 1e-6, 1e-6);
+    const next = Math.min(full, Math.max(minSpan, span));
+    const ratio = (focus - pdoView.t0) / Math.max(1e-12, pdoView.t1 - pdoView.t0);
+    let t0 = focus - ratio * next;
+    let t1 = t0 + next;
+    if (t0 < 0) { t1 -= t0; t0 = 0; }
+    if (t1 > full) { t0 -= t1 - full; t1 = full; }
+    if (t0 < 0) t0 = 0;
+    pdoView = { t0, t1 };
+    drawPdoAll();
+  }
+
+  function pdoPillRect(m, w) {
+    const x0 = pdoTimeToX(m.t0, w);
+    const x1 = pdoTimeToX(m.t1, w);
+    const x = Math.max(0, Math.min(w - 52, Math.min(x0, x1) + 2));
+    return { x, y: 2, w: 48, h: 16, closeX0: x + 32, closeX1: x + 48, showClose: true };
+  }
+
+  function findPdoMeasureAt(x, y, w) {
+    let best = null;
+    let bestSpan = Infinity;
+    let hitClose = false;
+    for (const m of pdoMeasures) {
+      const pill = pdoPillRect(m, w);
+      const onPill = x >= pill.x && x <= pill.x + pill.w && y >= pill.y && y <= pill.y + pill.h;
+      const onClose = onPill && x >= pill.closeX0 && x <= pill.closeX1;
+      const x0 = Math.min(pdoTimeToX(m.t0, w), pdoTimeToX(m.t1, w));
+      const x1 = Math.max(pdoTimeToX(m.t0, w), pdoTimeToX(m.t1, w));
+      const insideBand = (x >= x0 - 2 && x <= x1 + 2) || onPill;
+      if (!insideBand) continue;
+      const span = Math.abs(m.t1 - m.t0);
+      if (onClose && !hitClose) {
+        best = m;
+        bestSpan = span;
+        hitClose = true;
+      } else if (onClose === hitClose && span < bestSpan) {
+        best = m;
+        bestSpan = span;
+      }
+    }
+    if (!best) return null;
+    return { measure: best, isClose: hitClose };
+  }
+
+  function computePdoMeasureStats(ch, m) {
+    const events = ch.events || [];
+    const t0 = m.t0;
+    const t1 = m.t1;
+    const dt = Math.max(0, t1 - t0);
+    const valueAt = (t) => {
+      let res = null;
+      for (let i = 0; i < events.length; i++) {
+        if (events[i].t <= t) res = events[i];
+        else break;
+      }
+      return res;
+    };
+
+    const startEv = valueAt(t0);
+    const endEv = valueAt(t1);
+    const startVal = startEv ? startEv.val : null;
+    const endVal = endEv ? endEv.val : null;
+    const deltaVal = (startVal !== null && endVal !== null) ? (endVal - startVal) : null;
+
+    let idx = -1;
+    for (let i = 0; i < events.length; i++) {
+      if (events[i].t <= t0) idx = i;
+      else break;
+    }
+
+    let minVal = Infinity;
+    let maxVal = -Infinity;
+    let area = 0;
+    let coveredT = 0;
+    let highTime = 0;
+    let transitions = 0;
+
+    let curT = t0;
+    let curVal = idx >= 0 ? events[idx].val : null;
+    if (curVal !== null) {
+      minVal = Math.min(minVal, curVal);
+      maxVal = Math.max(maxVal, curVal);
+    }
+
+    for (let j = idx + 1; j < events.length; j++) {
+      if (events[j].t > t1) break;
+      const segEnd = events[j].t;
+      if (curVal !== null && segEnd > curT) {
+        const segDt = segEnd - curT;
+        area += curVal * segDt;
+        coveredT += segDt;
+        if (curVal >= 0.5) highTime += segDt;
+      }
+      if (!events[j].is_hold && events[j].t > t0) {
+        transitions++;
+      }
+      curT = segEnd;
+      curVal = events[j].val;
+      minVal = Math.min(minVal, curVal);
+      maxVal = Math.max(maxVal, curVal);
+    }
+    if (curVal !== null && t1 > curT) {
+      const segDt = t1 - curT;
+      area += curVal * segDt;
+      coveredT += segDt;
+      if (curVal >= 0.5) highTime += segDt;
+    }
+
+    const avgVal = coveredT > 0 ? (area / coveredT) : startVal;
+    if (minVal === Infinity) {
+      minVal = null;
+      maxVal = null;
+    }
+    const isBit = ch.dtype === 'bit' || ch.dtype === 'bool';
+    const dutyPct = (isBit && dt > 0) ? (highTime / dt) * 100 : null;
+    return {
+      dt,
+      freq: pdoFmtFreq(dt),
+      startEv,
+      endEv,
+      startVal,
+      endVal,
+      deltaVal,
+      minVal,
+      maxVal,
+      avgVal,
+      transitions,
+      isBit,
+      highTime,
+      dutyPct,
+    };
+  }
+
+  function fmtStatVal(v, dtype) {
+    if (v === null || v === undefined || Number.isNaN(v)) return '-';
+    if (dtype === 'bit' || dtype === 'bool') return v >= 0.5 ? '1' : '0';
+    if (Number.isInteger(v)) return String(v);
+    return v.toFixed(4);
+  }
+
+  function hidePdoMeasureTooltip() {
+    pdoMeasureTooltip.style.display = 'none';
+  }
+
+  function showPdoMeasureTooltip(m, ch, clientX, clientY) {
+    const s = computePdoMeasureStats(ch, m);
+    const chColor = CHANNEL_COLORS[ch.index % CHANNEL_COLORS.length];
+    let valRows = '';
+    if (s.startVal === null && s.minVal === null) {
+      valRows = '<div style="color:#94a3b8;">此時間區間內尚未有取樣資料</div>';
+    } else {
+      const deltaStr = s.deltaVal !== null ? (s.deltaVal > 0 ? '+' : '') + fmtStatVal(s.deltaVal, ch.dtype) : '-';
+      const avgStr = s.avgVal !== null ? (s.isBit ? s.avgVal.toFixed(3) : s.avgVal.toFixed(3)) : '-';
+      valRows =
+        `<div>起始值: ${s.startEv ? s.startEv.val_str : '-'}  |  結束值: ${s.endEv ? s.endEv.val_str : '-'}  |  ΔVal: ${deltaStr}</div>` +
+        `<div>Min: ${fmtStatVal(s.minVal, ch.dtype)}  |  Max: ${fmtStatVal(s.maxVal, ch.dtype)}  |  平均: ${avgStr}</div>` +
+        `<div>變化次數: ${s.transitions} 次` +
+        (s.isBit && s.dutyPct !== null ? `  |  高電位: ${pdoFmtTime(s.highTime)} (${s.dutyPct.toFixed(1)}%)` : '') +
+        '</div>';
+    }
+    pdoMeasureTooltip.innerHTML =
+      `<div style="font-weight:700;color:${m.color};margin-bottom:4px;">測量 M${m.id} <span style="color:#94a3b8;font-weight:400;">(右鍵或點 × 刪除)</span></div>` +
+      `<div>T1: ${pdoFmtTime(m.t0)}  |  T2: ${pdoFmtTime(m.t1)}</div>` +
+      `<div style="color:#f8fafc;font-weight:600;margin-bottom:4px;">ΔT: ${pdoFmtTime(s.dt)}  |  1/ΔT: ${s.freq}</div>` +
+      `<div style="color:${chColor};font-weight:600;margin-bottom:2px;">CH${ch.index + 1} · ${ch.loc_label || 'PDO'} (${ch.dtype})</div>` +
+      valRows;
+    pdoMeasureTooltip.style.display = 'block';
+    const rect = pdoMeasureTooltip.getBoundingClientRect();
+    let left = clientX + 14;
+    let top = clientY + 14;
+    if (left + rect.width > window.innerWidth - 8) left = Math.max(8, clientX - rect.width - 14);
+    if (top + rect.height > window.innerHeight - 8) top = Math.max(8, clientY - rect.height - 14);
+    pdoMeasureTooltip.style.left = left + 'px';
+    pdoMeasureTooltip.style.top = top + 'px';
+  }
+
+  function drawPdoAxis() {
+    const rect = pdoAxisWrap.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.max(rect.width, 300);
+    const h = 26;
+    const bw = Math.max(1, Math.round(w * dpr));
+    const bh = Math.max(1, Math.round(h * dpr));
+    if (pdoAxisCanvas.width !== bw || pdoAxisCanvas.height !== bh) {
+      pdoAxisCanvas.width = bw;
+      pdoAxisCanvas.height = bh;
+    }
+    const ctx = pdoAxisCanvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(0, 0, w, h);
+
+    for (const m of pdoMeasures) {
+      if (m.t1 < pdoView.t0 || m.t0 > pdoView.t1) continue;
+      const x0 = Math.max(0, pdoTimeToX(m.t0, w));
+      const x1 = Math.min(w, pdoTimeToX(m.t1, w));
+      ctx.fillStyle = m.color;
+      ctx.fillRect(x0, 0, Math.max(2, x1 - x0), 3);
+    }
+
+    const step = pdoNiceStep(pdoView.t1 - pdoView.t0);
+    const start = Math.ceil(pdoView.t0 / step) * step;
+    ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    for (let t = start; t <= pdoView.t1 + step * 0.01; t += step) {
+      const x = pdoTimeToX(t, w);
+      if (x < 0 || x > w) continue;
+      ctx.strokeStyle = '#334155';
+      ctx.beginPath();
+      ctx.moveTo(x, h - 5);
+      ctx.lineTo(x, h);
+      ctx.stroke();
+      ctx.fillStyle = '#94a3b8';
+      ctx.fillText(pdoFmtTime(t), x, h / 2 + 1);
+    }
+  }
+
+  function drawPdoRow(row) {
+    const { ch, color, canvas, canvasWrap, minVal, maxVal } = row;
+    const events = ch.events;
+    const rect = canvasWrap.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.max(rect.width, 300);
+    const h = Math.max(rect.height, 104);
+    const bw = Math.max(1, Math.round(w * dpr));
+    const bh = Math.max(1, Math.round(h * dpr));
+    if (canvas.width !== bw || canvas.height !== bh) {
+      canvas.width = bw;
+      canvas.height = bh;
+    }
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+
+    const padTop = 16;
+    const padBottom = 16;
+    const plotH = h - padTop - padBottom;
+    const valSpan = Math.max(maxVal - minVal, 1e-9);
+    const valToY = (v) => padTop + plotH - ((v - minVal) / valSpan) * plotH;
+
+    // 垂直時間參考網格線
+    const step = pdoNiceStep(pdoView.t1 - pdoView.t0);
+    const startT = Math.ceil(pdoView.t0 / step) * step;
+    ctx.strokeStyle = '#182235';
+    ctx.lineWidth = 1;
+    for (let t = startT; t <= pdoView.t1 + step * 0.01; t += step) {
+      const gx = pdoTimeToX(t, w);
+      if (gx < 0 || gx > w) continue;
+      ctx.beginPath();
+      ctx.moveTo(gx, 0);
+      ctx.lineTo(gx, h);
+      ctx.stroke();
+    }
+
+    // 背景水平參考網格線 (Max / Mid / Min)
+    ctx.strokeStyle = '#1e293b';
+    ctx.lineWidth = 1;
+    [0, 0.5, 1].forEach(ratio => {
+      const gy = padTop + plotH * ratio;
+      ctx.beginPath();
+      ctx.moveTo(0, gy);
+      ctx.lineTo(w, gy);
+      ctx.stroke();
+    });
+
+    // 繪製 Y 軸刻度文字
+    ctx.fillStyle = '#64748b';
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText(formatAxisNum(maxVal, ch.dtype), 4, padTop - 4);
+    ctx.fillText(formatAxisNum(minVal, ch.dtype), 4, h - 4);
+
+    // 繪製階梯波形 (Step Waveform，支援縮放/平移視窗裁剪)
+    if (events.length > 0 && events[0].t <= pdoView.t1) {
+      let startIdx = 0;
+      for (let i = 0; i < events.length; i++) {
+        if (events[i].t <= pdoView.t0) startIdx = i;
+        else break;
+      }
+
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+
+      let prevX = pdoTimeToX(Math.max(events[startIdx].t, pdoView.t0), w);
+      let prevY = valToY(events[startIdx].val);
+      ctx.moveTo(prevX, prevY);
+
+      for (let i = startIdx + 1; i < events.length; i++) {
+        if (events[i].t > pdoView.t1) break;
+        const currX = pdoTimeToX(events[i].t, w);
+        const currY = valToY(events[i].val);
+        ctx.lineTo(currX, prevY);
+        ctx.lineTo(currX, currY);
+        prevX = currX;
+        prevY = currY;
+      }
+      ctx.lineTo(pdoTimeToX(pdoView.t1, w), prevY);
+      ctx.stroke();
+
+      // 在每次數值變化的轉折點畫上小圓點並標註數值
+      ctx.fillStyle = color;
+      let lastLabelX = -999;
+      for (let i = 0; i < events.length; i++) {
+        if (events[i].is_hold) continue;
+        if (events[i].t < pdoView.t0 || events[i].t > pdoView.t1) continue;
+        const px = pdoTimeToX(events[i].t, w);
+        const py = valToY(events[i].val);
+        ctx.beginPath();
+        ctx.arc(px, py, 3, 0, Math.PI * 2);
+        ctx.fill();
+
+        if (px - lastLabelX > 48) {
+          ctx.fillStyle = '#f8fafc';
+          ctx.font = '11px monospace';
+          const textY = py < h / 2 ? py + 13 : py - 5;
+          ctx.fillText(events[i].val_str, px + 4, textY);
+          ctx.fillStyle = color;
+          lastLabelX = px;
+        }
+      }
+    }
+
+    // 繪製測量區塊（僅標記標籤，統計數值於滑鼠懸停時才顯示）
+    const drawBand = (t0, t1, bandColor, label, isHovered, pillRect) => {
+      if (t1 < pdoView.t0 || t0 > pdoView.t1) return;
+      const rawX0 = pdoTimeToX(t0, w);
+      const rawX1 = pdoTimeToX(t1, w);
+      const left = Math.max(0, Math.min(rawX0, rawX1));
+      const right = Math.min(w, Math.max(rawX0, rawX1));
+      const bandW = Math.max(1, right - left);
+
+      ctx.save();
+      ctx.fillStyle = bandColor;
+      ctx.globalAlpha = isHovered ? 0.24 : 0.14;
+      ctx.fillRect(left, 0, bandW, h);
+
+      ctx.globalAlpha = isHovered ? 0.95 : 0.8;
+      ctx.strokeStyle = bandColor;
+      ctx.lineWidth = isHovered ? 2 : 1.2;
+      if (rawX0 >= 0 && rawX0 <= w) {
+        ctx.beginPath();
+        ctx.moveTo(rawX0 + 0.5, 0);
+        ctx.lineTo(rawX0 + 0.5, h);
+        ctx.stroke();
+      }
+      if (rawX1 >= 0 && rawX1 <= w) {
+        ctx.beginPath();
+        ctx.moveTo(rawX1 + 0.5, 0);
+        ctx.lineTo(rawX1 + 0.5, h);
+        ctx.stroke();
+      }
+
+      if (pillRect) {
+        ctx.globalAlpha = 0.92;
+        ctx.fillStyle = '#0f172a';
+        ctx.fillRect(pillRect.x, pillRect.y, pillRect.w, pillRect.h);
+        ctx.strokeStyle = bandColor;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(pillRect.x + 0.5, pillRect.y + 0.5, pillRect.w - 1, pillRect.h - 1);
+        ctx.fillStyle = bandColor;
+        ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(label, pillRect.x + 5, pillRect.y + pillRect.h / 2 + 0.5);
+        if (pillRect.showClose) {
+          ctx.fillStyle = '#94a3b8';
+          ctx.fillText('×', pillRect.closeX0 + 3, pillRect.y + pillRect.h / 2 + 0.5);
+        }
+      }
+      ctx.restore();
+    };
+
+    for (const m of pdoMeasures) {
+      const isHovered = Boolean(pdoHoveredMeasure && pdoHoveredMeasure.id === m.id);
+      drawBand(m.t0, m.t1, m.color, `M${m.id}`, isHovered, pdoPillRect(m, w));
+    }
+    if (pdoMeasureDrag) {
+      const pt0 = Math.min(pdoMeasureDrag.startT, pdoMeasureDrag.currT);
+      const pt1 = Math.max(pdoMeasureDrag.startT, pdoMeasureDrag.currT);
+      const px = Math.max(0, Math.min(w - 30, pdoTimeToX(pt0, w) + 2));
+      drawBand(pt0, pt1, '#38bdf8', 'M?', true, { x: px, y: 2, w: 28, h: 16, showClose: false });
+    }
+
+    // 同步垂直游標線
+    if (pdoCursorT != null && pdoCursorT >= pdoView.t0 && pdoCursorT <= pdoView.t1) {
+      const cx = pdoTimeToX(pdoCursorT, w);
+      ctx.save();
+      ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+      ctx.setLineDash([3, 3]);
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(cx, 0);
+      ctx.lineTo(cx, h);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  function drawPdoAll() {
+    if (pdoRowModels.length === 0) return;
+    drawPdoAxis();
+    pdoRowModels.forEach(drawPdoRow);
+  }
+
   function renderPdoWaveforms(data) {
     const pdoChannels = data.channels.filter(ch => ch.is_pdo && !ch.error && ch.events && ch.events.length > 0);
     if (pdoChannels.length === 0) {
       scopeDock.style.display = 'none';
+      pdoRowModels = [];
+      hidePdoMeasureTooltip();
       return;
     }
 
     scopeDock.style.display = 'block';
     waveformsContainer.innerHTML = '';
     const totalDuration = Math.max(data.duration || 1e-6, 1e-6);
+    const nextFile = data.file || '';
+    if (nextFile !== pdoFile) {
+      pdoFile = nextFile;
+      pdoDuration = totalDuration;
+      pdoView = { t0: 0, t1: totalDuration };
+      pdoMeasures = [];
+      pdoNextMeasureId = 1;
+      pdoHoveredMeasure = null;
+      hidePdoMeasureTooltip();
+    } else {
+      const wasFull = pdoView.t0 <= 1e-9 && Math.abs(pdoView.t1 - pdoDuration) < 1e-6;
+      pdoDuration = totalDuration;
+      if (wasFull) {
+        pdoView = { t0: 0, t1: totalDuration };
+      } else {
+        pdoView.t1 = Math.min(pdoView.t1, totalDuration);
+        pdoView.t0 = Math.min(pdoView.t0, Math.max(0, pdoView.t1 - 20e-6));
+      }
+    }
+
+    pdoRowModels = [];
 
     pdoChannels.forEach((ch) => {
       const color = CHANNEL_COLORS[ch.index % CHANNEL_COLORS.length];
@@ -786,99 +1319,178 @@ LIVE_UI_INJECTION = """
       row.appendChild(canvasWrap);
       waveformsContainer.appendChild(row);
 
-      requestAnimationFrame(() => {
-        const rect = canvasWrap.getBoundingClientRect();
-        const dpr = window.devicePixelRatio || 1;
-        const w = Math.max(rect.width, 300);
-        const h = Math.max(rect.height, 104);
-        canvas.width = w * dpr;
-        canvas.height = h * dpr;
-        const ctx = canvas.getContext('2d');
-        ctx.scale(dpr, dpr);
+      const rowModel = { ch, color, canvas, canvasWrap, minVal, maxVal };
+      pdoRowModels.push(rowModel);
 
-        const padTop = 16;
-        const padBottom = 16;
-        const plotH = h - padTop - padBottom;
-        const valSpan = Math.max(maxVal - minVal, 1e-9);
+      canvasWrap.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        const cRect = canvasWrap.getBoundingClientRect();
+        const factor = e.deltaY > 0 ? 1.18 : 1 / 1.18;
+        pdoZoomAt(e.clientX - cRect.left, Math.max(cRect.width, 1), factor);
+      }, { passive: false });
 
-        const valToY = (v) => padTop + plotH - ((v - minVal) / valSpan) * plotH;
-        const timeToX = (t) => (t / totalDuration) * w;
+      canvasWrap.addEventListener('dblclick', pdoResetView);
 
-        // 背景水平參考網格線 (Max / Mid / Min)
-        ctx.strokeStyle = '#1e293b';
-        ctx.lineWidth = 1;
-        [0, 0.5, 1].forEach(ratio => {
-          const gy = padTop + plotH * ratio;
-          ctx.beginPath();
-          ctx.moveTo(0, gy);
-          ctx.lineTo(w, gy);
-          ctx.stroke();
-        });
-
-        // 繪製 Y 軸刻度文字
-        ctx.fillStyle = '#64748b';
-        ctx.font = '10px monospace';
-        ctx.fillText(formatAxisNum(maxVal, ch.dtype), 4, padTop - 4);
-        ctx.fillText(formatAxisNum(minVal, ch.dtype), 4, h - 4);
-
-        // 繪製階梯波形 (Step Waveform)
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-
-        let prevX = timeToX(events[0].t);
-        let prevY = valToY(events[0].val);
-        ctx.moveTo(prevX, prevY);
-
-        for (let i = 1; i < events.length; i++) {
-          const currX = timeToX(events[i].t);
-          const currY = valToY(events[i].val);
-          ctx.lineTo(currX, prevY);
-          ctx.lineTo(currX, currY);
-          prevX = currX;
-          prevY = currY;
+      canvasWrap.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0) return;
+        const cRect = canvasWrap.getBoundingClientRect();
+        const w = Math.max(cRect.width, 1);
+        const x = e.clientX - cRect.left;
+        const y = e.clientY - cRect.top;
+        const hit = findPdoMeasureAt(x, y, w);
+        if (hit && hit.isClose) {
+          pdoMeasures = pdoMeasures.filter(m => m.id !== hit.measure.id);
+          if (pdoHoveredMeasure && pdoHoveredMeasure.id === hit.measure.id) pdoHoveredMeasure = null;
+          hidePdoMeasureTooltip();
+          updatePdoMeasureButtons();
+          drawPdoAll();
+          return;
         }
-        ctx.lineTo(w, prevY);
-        ctx.stroke();
+        canvasWrap.setPointerCapture(e.pointerId);
+        hidePdoMeasureTooltip();
+        if (pdoMeasureMode || e.shiftKey) {
+          const t = Math.min(pdoView.t1, Math.max(pdoView.t0, pdoXToTime(x, w)));
+          pdoMeasureDrag = { startX: x, startT: t, currT: t };
+          drawPdoAll();
+        } else {
+          pdoDrag = { x: e.clientX, t0: pdoView.t0, t1: pdoView.t1, w };
+        }
+      });
 
-        // 在每次數值變化的轉折點畫上小圓點並標註數值
-        ctx.fillStyle = color;
-        let lastLabelX = -999;
+      canvasWrap.addEventListener('pointermove', (e) => {
+        const cRect = canvasWrap.getBoundingClientRect();
+        const w = Math.max(cRect.width, 1);
+        const x = e.clientX - cRect.left;
+        const y = e.clientY - cRect.top;
+
+        if (pdoMeasureDrag) {
+          pdoMeasureDrag.currT = Math.min(pdoView.t1, Math.max(pdoView.t0, pdoXToTime(x, w)));
+          pdoCursorT = pdoMeasureDrag.currT;
+          drawPdoAll();
+          return;
+        }
+        if (pdoDrag) {
+          const span = pdoDrag.t1 - pdoDrag.t0;
+          const plotW = Math.max(1, pdoDrag.w - PDO_PAD.left - PDO_PAD.right);
+          const dx = e.clientX - pdoDrag.x;
+          const dt = (dx / plotW) * span;
+          let t0 = pdoDrag.t0 - dt;
+          let t1 = pdoDrag.t1 - dt;
+          const full = Math.max(pdoDuration || 1e-6, 1e-6);
+          if (t0 < 0) { t1 -= t0; t0 = 0; }
+          if (t1 > full) { t0 -= t1 - full; t1 = full; }
+          if (t0 < 0) t0 = 0;
+          pdoView = { t0, t1 };
+          pdoCursorT = Math.min(pdoView.t1, Math.max(pdoView.t0, pdoXToTime(x, w)));
+          hidePdoMeasureTooltip();
+          drawPdoAll();
+          return;
+        }
+
+        const hoverT = Math.min(pdoView.t1, Math.max(pdoView.t0, pdoXToTime(x, w)));
+        pdoCursorT = hoverT;
+        let activeEv = events[0];
         for (let i = 0; i < events.length; i++) {
-          if (events[i].is_hold) continue;
-          const px = timeToX(events[i].t);
-          const py = valToY(events[i].val);
-          ctx.beginPath();
-          ctx.arc(px, py, 3, 0, Math.PI * 2);
-          ctx.fill();
-
-          if (px - lastLabelX > 48) {
-            ctx.fillStyle = '#f8fafc';
-            ctx.font = '11px monospace';
-            const textY = py < h / 2 ? py + 13 : py - 5;
-            ctx.fillText(events[i].val_str, px + 4, textY);
-            ctx.fillStyle = color;
-            lastLabelX = px;
-          }
+          if (events[i].t <= hoverT) activeEv = events[i];
+          else break;
+        }
+        if (activeEv) {
+          cursorReadout.textContent = `時間: ${pdoFmtTime(hoverT)} (${hoverT.toFixed(6)}s) | CH${ch.index + 1} (${ch.loc_label}) 數值 = ${activeEv.val_str} (Frame #${activeEv.n})`;
         }
 
-        // 滑鼠懸停游標即時查詢數值
-        canvasWrap.addEventListener('mousemove', (e) => {
+        const hit = findPdoMeasureAt(x, y, w);
+        if (hit) {
+          pdoHoveredMeasure = { id: hit.measure.id, ch };
+          showPdoMeasureTooltip(hit.measure, ch, e.clientX, e.clientY);
+        } else {
+          pdoHoveredMeasure = null;
+          hidePdoMeasureTooltip();
+        }
+        canvasWrap.style.cursor = hit && hit.isClose ? 'pointer' : (pdoMeasureMode ? 'col-resize' : 'crosshair');
+        drawPdoAll();
+      });
+
+      const endPdoDrag = (e) => {
+        if (pdoMeasureDrag) {
+          if (canvasWrap.hasPointerCapture(e.pointerId)) {
+            canvasWrap.releasePointerCapture(e.pointerId);
+          }
           const cRect = canvasWrap.getBoundingClientRect();
-          const mouseX = e.clientX - cRect.left;
-          const hoverT = (mouseX / w) * totalDuration;
-          let activeEv = events[0];
-          for (let i = 0; i < events.length; i++) {
-            if (events[i].t <= hoverT) activeEv = events[i];
-            else break;
+          const w = Math.max(cRect.width, 1);
+          const pxSpan = Math.abs(pdoTimeToX(pdoMeasureDrag.currT, w) - pdoTimeToX(pdoMeasureDrag.startT, w));
+          if (pxSpan >= 4) {
+            const id = pdoNextMeasureId++;
+            pdoMeasures.push({
+              id,
+              t0: Math.min(pdoMeasureDrag.startT, pdoMeasureDrag.currT),
+              t1: Math.max(pdoMeasureDrag.startT, pdoMeasureDrag.currT),
+              color: PDO_MEASURE_COLORS[(id - 1) % PDO_MEASURE_COLORS.length],
+            });
+            updatePdoMeasureButtons();
           }
-          if (activeEv) {
-            cursorReadout.textContent = `時間: ${hoverT.toFixed(6)}s | CH${ch.index + 1} (${ch.loc_label}) 數值 = ${activeEv.val_str} (Frame #${activeEv.n})`;
-          }
-        });
+          pdoMeasureDrag = null;
+          drawPdoAll();
+          return;
+        }
+        if (pdoDrag && canvasWrap.hasPointerCapture(e.pointerId)) {
+          canvasWrap.releasePointerCapture(e.pointerId);
+        }
+        pdoDrag = null;
+      };
+
+      canvasWrap.addEventListener('pointerup', endPdoDrag);
+      canvasWrap.addEventListener('pointercancel', endPdoDrag);
+
+      canvasWrap.addEventListener('contextmenu', (e) => {
+        const cRect = canvasWrap.getBoundingClientRect();
+        const w = Math.max(cRect.width, 1);
+        const x = e.clientX - cRect.left;
+        const y = e.clientY - cRect.top;
+        const hit = findPdoMeasureAt(x, y, w);
+        if (!hit) return;
+        e.preventDefault();
+        pdoMeasures = pdoMeasures.filter(m => m.id !== hit.measure.id);
+        if (pdoHoveredMeasure && pdoHoveredMeasure.id === hit.measure.id) pdoHoveredMeasure = null;
+        hidePdoMeasureTooltip();
+        updatePdoMeasureButtons();
+        drawPdoAll();
+      });
+
+      canvasWrap.addEventListener('pointerleave', () => {
+        if (pdoDrag || pdoMeasureDrag) return;
+        pdoCursorT = null;
+        pdoHoveredMeasure = null;
+        hidePdoMeasureTooltip();
+        canvasWrap.style.cursor = pdoMeasureMode ? 'col-resize' : 'crosshair';
+        cursorReadout.textContent = PDO_DEFAULT_HINT;
+        drawPdoAll();
       });
     });
+
+    updatePdoMeasureButtons();
+    requestAnimationFrame(drawPdoAll);
   }
+
+  pdoAxisWrap.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const rect = pdoAxisWrap.getBoundingClientRect();
+    const factor = e.deltaY > 0 ? 1.18 : 1 / 1.18;
+    pdoZoomAt(e.clientX - rect.left, Math.max(rect.width, 1), factor);
+  }, { passive: false });
+  pdoAxisWrap.addEventListener('dblclick', pdoResetView);
+
+  pdoFullBtn.addEventListener('click', pdoResetView);
+  pdoMeasureBtn.addEventListener('click', () => {
+    pdoMeasureMode = !pdoMeasureMode;
+    updatePdoMeasureButtons();
+  });
+  pdoClearMeasuresBtn.addEventListener('click', () => {
+    pdoMeasures = [];
+    pdoHoveredMeasure = null;
+    hidePdoMeasureTooltip();
+    updatePdoMeasureButtons();
+    drawPdoAll();
+  });
 
   helperPanel.style.display = 'none';
   helperToggle.addEventListener('click', () => {
@@ -907,24 +1519,50 @@ LIVE_UI_INJECTION = """
     pdoPreview.textContent = buildPdoSyntax();
   }
 
+  function getChannelFilterInputs() {
+    const chInputs = Array.from(document.querySelectorAll('#channels input'));
+    if (chInputs.length > 0) return chInputs;
+    return Array.from(document.querySelectorAll('input')).filter(i => !i.closest('#live-capture-bar'));
+  }
+
+  function triggerScanButton() {
+    const runBtn = document.getElementById('run') || Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === '掃描');
+    if (runBtn) runBtn.click();
+  }
+
   [pdoBase, pdoByte, pdoDtype, pdoBit, pdoLen, pdoDg].forEach(el => {
     el.addEventListener('input', updatePdoPreview);
     el.addEventListener('change', updatePdoPreview);
+    el.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        const syntax = buildPdoSyntax();
+        const inputs = getChannelFilterInputs();
+        if (!inputs.some(i => i.value.trim() === syntax)) {
+          const emptyInput = inputs.find(i => !i.value.trim());
+          if (emptyInput) {
+            emptyInput.value = syntax;
+            emptyInput.dispatchEvent(new Event('input', { bubbles: true }));
+            emptyInput.dispatchEvent(new Event('change', { bubbles: true }));
+            pdoPreview.textContent = `已填入頻道並觸發掃描: ${syntax}`;
+          }
+        }
+        triggerScanButton();
+      }
+    });
   });
 
   pdoCopyBtn.addEventListener('click', () => {
     const syntax = buildPdoSyntax();
     navigator.clipboard?.writeText(syntax).catch(() => {});
-    const inputs = Array.from(document.querySelectorAll('input[type="text"]')).filter(i => !i.closest('#live-capture-bar'));
+    const inputs = getChannelFilterInputs();
     const emptyInput = inputs.find(i => !i.value.trim());
     if (emptyInput) {
       emptyInput.value = syntax;
       emptyInput.dispatchEvent(new Event('input', { bubbles: true }));
       emptyInput.dispatchEvent(new Event('change', { bubbles: true }));
       pdoPreview.textContent = `已填入頻道並觸發掃描: ${syntax}`;
-      const buttons = Array.from(document.querySelectorAll('button'));
-      const scanBtn = buttons.find(b => b.textContent.trim() === '掃描');
-      if (scanBtn) scanBtn.click();
+      triggerScanButton();
     } else {
       pdoPreview.textContent = `已複製到剪貼簿: ${syntax}`;
     }
@@ -1043,7 +1681,7 @@ class Handler(BaseHTTPRequestHandler):
         if "<body" in html.lower():
             html = re.sub(
                 r"(<body[^>]*>)",
-                r"\1" + LIVE_UI_INJECTION,
+                lambda m: m.group(1) + LIVE_UI_INJECTION,
                 html,
                 count=1,
                 flags=re.IGNORECASE,
