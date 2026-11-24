@@ -623,7 +623,7 @@ def scan_all(path, filters):
 
 # --- 前端注入：即時監控面板 + PDO 規則產生器 + HTML5 Canvas 數值階梯波形渲染器 ---
 LIVE_UI_INJECTION = """
-<div id="live-capture-bar" style="background:#1e293b;color:#f8fafc;padding:10px 16px;font-family:system-ui,sans-serif;border-bottom:1px solid #334155;font-size:13px;">
+<div id="live-capture-bar" style="flex-shrink:0;background:#1e293b;color:#f8fafc;padding:10px 16px;font-family:system-ui,sans-serif;border-bottom:1px solid #334155;font-size:13px;">
   <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
     <strong style="color:#38bdf8;">⚡ 即時抓包監控：</strong>
     <select id="live-iface" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px 8px;border-radius:4px;max-width:300px;">
@@ -661,7 +661,7 @@ LIVE_UI_INJECTION = """
 </div>
 
 <!-- 浮動數值波形檢視視窗：自動為所有 PDO 頻道繪製真實 Y 軸數值階梯曲線 -->
-<div id="pdo-scope-dock" style="display:none;background:#0b1120;color:#e2e8f0;padding:12px 16px;border-bottom:2px solid #0284c7;font-family:system-ui,sans-serif;">
+<div id="pdo-scope-dock" style="display:none;flex-shrink:0;background:#0b1120;color:#e2e8f0;padding:12px 16px;border-bottom:2px solid #0284c7;font-family:system-ui,sans-serif;">
   <div style="display:flex;align-items:center;gap:8px;justify-content:space-between;margin-bottom:8px;flex-wrap:wrap;">
     <strong style="color:#38bdf8;font-size:14px;">📊 EtherCAT PDO 數值波形示波器 (Y軸：實際工程數值 / X軸：相對時間)</strong>
     <div style="display:flex;align-items:center;gap:6px;">

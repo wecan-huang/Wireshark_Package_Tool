@@ -33,6 +33,7 @@
     border-bottom: 1px solid var(--line);
     background: var(--panel);
     flex-wrap: wrap;
+    flex-shrink: 0;
   }
   header h1 {
     margin: 0;
@@ -99,8 +100,9 @@
   .ch input:focus { border-color: #4c9aff; }
   .ch input.bad { border-color: var(--danger); color: #fecaca; }
   #readout {
-    flex: 1;
-    min-height: 42px;
+    flex: 0 0 408px;
+    height: 408px;
+    overflow-y: auto;
     padding: 8px 14px 12px;
     border-top: 1px solid var(--line);
     color: var(--text);
@@ -139,6 +141,8 @@
   <button id="full" class="ghost" type="button">全程</button>
   <button id="la-measure-btn" class="ghost" type="button" title="開啟後拖曳建立時間測量區塊（平時亦可按住 Shift+拖曳）">📏 測量</button>
   <button id="la-clear-measures" class="ghost" type="button" disabled>清除測量</button>
+  <button id="la-add-ch" class="ghost" type="button" title="顯示下一個空白頻道以新增監控">+ 新增頻道</button>
+  <button id="la-toggle-empty" class="ghost" type="button" title="切換隱藏空白頻道或顯示全部 20 軌">顯示全部 (20)</button>
   <span id="status"></span>
 </header>
 <div class="scope">
@@ -170,13 +174,20 @@ const axisCanvas = document.getElementById("axis");
 const plotCanvas = document.getElementById("plot");
 const channelBox = document.getElementById("channels");
 
+const scopeEl = document.querySelector(".scope");
 const laMeasureBtn = document.getElementById("la-measure-btn");
 const laClearMeasuresBtn = document.getElementById("la-clear-measures");
+const laAddChBtn = document.getElementById("la-add-ch");
+const laToggleEmptyBtn = document.getElementById("la-toggle-empty");
 const laMeasureTooltip = document.getElementById("la-measure-tooltip");
 
 const MEASURE_COLORS = ["#38bdf8", "#f59e0b", "#10b981", "#ec4899", "#a855f7", "#fb923c"];
 
 const inputs = [];
+const rows = [];
+let hideEmptyChannels = true;
+const manuallyShown = new Set();
+let visibleChannels = [];
 let meta = { duration: 1, packets: 0, file: "" };
 let view = { t0: 0, t1: 1 };
 let results = Array.from({ length: CHANNELS }, () => ({ error: null, events: [] }));
@@ -190,10 +201,37 @@ let hoveredMeasureId = null;
 
 function storageKey() { return "packet-scope:" + (fileSelect.value || ""); }
 
+function updateVisibleChannels(redraw = true) {
+  if (!hideEmptyChannels) {
+    visibleChannels = Array.from({ length: CHANNELS }, (_, i) => i);
+  } else {
+    visibleChannels = [];
+    for (let i = 0; i < CHANNELS; i++) {
+      if (inputs[i].value.trim().length > 0 || manuallyShown.has(i)) {
+        visibleChannels.push(i);
+      }
+    }
+    if (visibleChannels.length === 0) {
+      manuallyShown.add(0);
+      visibleChannels = [0];
+    }
+  }
+  const visibleSet = new Set(visibleChannels);
+  rows.forEach((row, i) => {
+    row.style.display = visibleSet.has(i) ? "" : "none";
+  });
+  scopeEl.style.setProperty("--channels", String(visibleChannels.length));
+  laToggleEmptyBtn.textContent = hideEmptyChannels ? "顯示全部 (20)" : "隱藏空白軌";
+  laAddChBtn.disabled = !hideEmptyChannels || visibleChannels.length >= CHANNELS;
+  if (redraw) draw();
+}
+
 function loadFilters() {
   let saved = [];
   try { saved = JSON.parse(localStorage.getItem(storageKey()) || "[]"); } catch (e) { saved = []; }
   inputs.forEach((input, i) => { input.value = typeof saved[i] === "string" ? saved[i] : ""; });
+  manuallyShown.clear();
+  updateVisibleChannels(false);
 }
 
 function saveFilters() {
@@ -220,9 +258,12 @@ function buildRows() {
     input.addEventListener("input", () => {
       input.classList.remove("bad");
       input.removeAttribute("title");
+      manuallyShown.add(i);
+      updateVisibleChannels(true);
     });
     row.append(swatch, name, input);
     channelBox.append(row);
+    rows.push(row);
     inputs.push(input);
   }
 }
@@ -276,6 +317,8 @@ async function loadMeta() {
 
 async function scan() {
   saveFilters();
+  manuallyShown.clear();
+  updateVisibleChannels(false);
   const button = document.getElementById("run");
   button.disabled = true;
   setStatus("掃描中");
@@ -517,17 +560,17 @@ function drawPlot() {
     ctx.stroke();
   }
 
-  for (let i = 0; i < CHANNELS; i++) {
-    const y0 = i * ROW;
-    if (i % 2 === 1) {
+  visibleChannels.forEach((chIdx, visRow) => {
+    const y0 = visRow * ROW;
+    if (visRow % 2 === 1) {
       ctx.fillStyle = "rgba(255,255,255,0.015)";
       ctx.fillRect(0, y0, w, ROW);
     }
-    const channel = results[i] || { events: [], error: null };
-    const active = inputs[i].value.trim().length > 0;
+    const channel = results[chIdx] || { events: [], error: null };
+    const active = inputs[chIdx].value.trim().length > 0;
     const yBase = y0 + ROW - 7;
     const yTop = y0 + 6;
-    ctx.strokeStyle = channel.error ? "#f87171" : (active ? COLORS[i] : "#3a4454");
+    ctx.strokeStyle = channel.error ? "#f87171" : (active ? COLORS[chIdx] : "#3a4454");
     ctx.globalAlpha = active ? 0.55 : 0.8;
     ctx.lineWidth = 1;
     ctx.beginPath();
@@ -535,10 +578,10 @@ function drawPlot() {
     ctx.lineTo(w, yBase + 0.5);
     ctx.stroke();
     ctx.globalAlpha = 1;
-    if (!active || channel.error) continue;
+    if (!active || channel.error) return;
 
-    ctx.strokeStyle = COLORS[i];
-    ctx.shadowColor = COLORS[i];
+    ctx.strokeStyle = COLORS[chIdx];
+    ctx.shadowColor = COLORS[chIdx];
     ctx.shadowBlur = 8;
     ctx.lineWidth = 1.4;
     ctx.beginPath();
@@ -553,7 +596,7 @@ function drawPlot() {
     }
     ctx.stroke();
     ctx.shadowBlur = 0;
-  }
+  });
 
   const drawBand = (t0, t1, color, label, isHovered, pillRect) => {
     if (t1 < view.t0 || t0 > view.t1) return;
@@ -658,12 +701,12 @@ function paintReadout() {
     readout.innerHTML = head + '   <span class="dim">此時間沒有脈衝</span>';
     return;
   }
-  const lines = hits.slice(0, 6).map((hit) => {
+  const lines = hits.slice(0, CHANNELS).map((hit) => {
     const ev = hit.event;
     const text = "CH" + hit.channel + "  #" + ev.n + "  " + (ev.proto || "") + "  " + (ev.info || "");
     return '<span style="color:' + hit.color + '">' + escapeHtml(text) + "</span>";
   });
-  const extra = hits.length > 6 ? ' <span class="dim">+' + (hits.length - 6) + "</span>" : "";
+  const extra = hits.length > CHANNELS ? ' <span class="dim">+' + (hits.length - CHANNELS) + "</span>" : "";
   readout.innerHTML = head + "<br>" + lines.join("<br>") + extra;
 }
 
@@ -832,6 +875,22 @@ laClearMeasuresBtn.addEventListener("click", () => {
   updateMeasureButtons();
   draw();
 });
+laAddChBtn.addEventListener("click", () => {
+  const visSet = new Set(visibleChannels);
+  for (let i = 0; i < CHANNELS; i++) {
+    if (!visSet.has(i)) {
+      manuallyShown.add(i);
+      updateVisibleChannels(true);
+      inputs[i].focus();
+      return;
+    }
+  }
+});
+laToggleEmptyBtn.addEventListener("click", () => {
+  hideEmptyChannels = !hideEmptyChannels;
+  if (hideEmptyChannels) manuallyShown.clear();
+  updateVisibleChannels(true);
+});
 document.getElementById("run").addEventListener("click", scan);
 document.getElementById("full").addEventListener("click", resetView);
 document.getElementById("reload").addEventListener("click", () => refreshFiles(fileSelect.value));
@@ -843,6 +902,7 @@ fileSelect.addEventListener("change", () => {
 window.addEventListener("resize", draw);
 
 buildRows();
+updateVisibleChannels(false);
 refreshFiles();
 </script>
 </body>
