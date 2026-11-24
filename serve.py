@@ -5,6 +5,7 @@ import atexit
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -22,14 +23,97 @@ PORT = 8765
 CHANNEL_COUNT = 20
 MAX_BODY = 1024 * 1024
 
-APP_CANDIDATES = [
-    Path("/Applications/Wireshark.app/Contents/MacOS"),
-    Path(r"C:\Program Files\Wireshark"),
-    Path(r"C:\Program Files (x86)\Wireshark"),
-]
+def get_wireshark_candidates():
+    candidates = [
+        Path("/Applications/Wireshark.app/Contents/MacOS"),
+        Path("/usr/local/bin"),
+        Path("/opt/homebrew/bin"),
+        Path(r"C:\Program Files\Wireshark"),
+        Path(r"C:\Program Files (x86)\Wireshark"),
+        Path(r"D:\Program Files\Wireshark"),
+        Path(r"D:\Program Files (x86)\Wireshark"),
+        Path(r"D:\02_ProgramFile\Wireshark"),
+        Path(r"C:\02_ProgramFile\Wireshark"),
+    ]
+    # 加入所在磁碟常見路徑
+    if os.name == "nt" and BASE.drive:
+        candidates.extend([
+            Path(f"{BASE.drive}\\Program Files\\Wireshark"),
+            Path(f"{BASE.drive}\\02_ProgramFile\\Wireshark"),
+            Path(f"{BASE.drive}\\Wireshark"),
+        ])
+    # 檢查環境變數
+    for env_var in ("WIRESHARK_PATH", "WIRESHARK_HOME", "WIRESHARK_DIR"):
+        val = os.environ.get(env_var)
+        if val:
+            candidates.append(Path(val))
+    for pf in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramW6432")):
+        if pf:
+            candidates.append(Path(pf) / "Wireshark")
+   # Windows 機碼查詢 Wireshark 安裝目錄
+    if os.name == "nt":
+        try:
+            import winreg
+            for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                for subkey in (
+                    r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\Wireshark.exe",
+                    r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\tshark.exe",
+                ):
+                    try:
+                        with winreg.OpenKey(root, subkey) as key:
+                            path_val, _ = winreg.QueryValueEx(key, "Path")
+                            if path_val:
+                                for p in str(path_val).split(";"):
+                                    if p.strip():
+                                        candidates.append(Path(p.strip()))
+                    except OSError:
+                        pass
+                    try:
+                        with winreg.OpenKey(root, subkey) as key:
+                            default_val, _ = winreg.QueryValueEx(key, "")
+                            if default_val:
+                                candidates.append(Path(default_val).parent)
+                    except OSError:
+                        pass
+                for subkey in (r"SOFTWARE\Wireshark", r"SOFTWARE\WOW6432Node\Wireshark"):
+                    try:
+                        with winreg.OpenKey(root, subkey) as key:
+                            for val_name in ("InstallDir", "Path", "Install_Dir", "InstallLocation"):
+                                try:
+                                    val, _ = winreg.QueryValueEx(key, val_name)
+                                    if val:
+                                        candidates.append(Path(val))
+                                except OSError:
+                                    pass
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+    seen = set()
+    unique = []
+    for c in candidates:
+        try:
+            if c.is_dir():
+                resolved = c.resolve()
+                if resolved not in seen:
+                    seen.add(resolved)
+                    unique.append(resolved)
+        except Exception:
+            pass
+    return unique
 
+APP_CANDIDATES = get_wireshark_candidates()
 
 def find_tool(name):
+    # 1. 優先檢查系統 PATH
+    found = shutil.which(name)
+    if found:
+        return found
+    if os.name == "nt" and not name.lower().endswith(".exe"):
+        found = shutil.which(f"{name}.exe")
+        if found:
+            return found
+    # 2. 檢查各候選目錄（Windows 機碼、macOS 應用程式目錄、常用自訂路徑等）
     exe_name = f"{name}.exe" if os.name == "nt" else name
     for directory in APP_CANDIDATES:
         candidate = directory / exe_name
@@ -66,19 +150,25 @@ atexit.register(stop_live_capture)
 
 
 def list_interfaces():
-    proc = subprocess.run(
-        [TSHARK, "-D"],
-        capture_output=True,
-        text=True,
-        errors="replace",
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or "無法取得網路介面清單")
+    try:
+        proc = subprocess.run(
+            [TSHARK, "-D"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError:
+        return []
+
     interfaces = []
     for line in proc.stdout.splitlines():
         match = re.match(r"^(\d+)\.\s+(.+)$", line.strip())
         if match:
             interfaces.append({"id": match.group(1), "name": match.group(2)})
+    if not interfaces and proc.returncode != 0:
+        err = proc.stderr.strip()
+        raise RuntimeError(err or "無法取得網路介面清單")
     return interfaces
 
 
@@ -102,13 +192,17 @@ def start_live_capture(interface_id):
             "-w",
             str(live_path),
         ]
-        CAPTURE_PROC = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            errors="replace",
-        )
+        try:
+            CAPTURE_PROC = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except FileNotFoundError:
+            raise RuntimeError(f"找不到 {TSHARK}，請確認已安裝 Wireshark 或設定 WIRESHARK_PATH 環境變數")
         CAPTURE_INTERFACE = str(interface_id)
 
     time.sleep(0.5)
@@ -154,25 +248,32 @@ def resolve_capture(name):
 
 
 def capture_meta(path, fallback_duration=None):
-    proc = subprocess.run(
-        [CAPINFOS, str(path)],
-        capture_output=True,
-        text=True,
-        errors="replace",
-    )
+    proc = None
+    try:
+        proc = subprocess.run(
+            [CAPINFOS, str(path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError:
+        if fallback_duration is None:
+            raise RuntimeError(f"找不到 {CAPINFOS}，請確認已安裝 Wireshark 或設定 WIRESHARK_PATH 環境變數")
     packets = 0
     duration = None
-    for line in proc.stdout.splitlines():
-        if line.startswith("Number of packets:"):
-            try:
-                packets = int(line.split(":", 1)[1].strip())
-            except ValueError:
-                pass
-        elif line.startswith("Capture duration:"):
-            try:
-                duration = float(line.split(":", 1)[1].strip().split()[0])
-            except ValueError:
-                pass
+    if proc is not None:
+        for line in proc.stdout.splitlines():
+            if line.startswith("Number of packets:"):
+                try:
+                    packets = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    pass
+            elif line.startswith("Capture duration:"):
+                try:
+                    duration = float(line.split(":", 1)[1].strip().split()[0])
+                except ValueError:
+                    pass
 
     if duration is None:
         if fallback_duration is not None:
@@ -299,32 +400,36 @@ def scan_ecat_pdo_channel(path, raw_filter):
     except ValueError as exc:
         return {"filter": raw_filter, "error": str(exc), "events": [], "is_pdo": True}
 
-    proc = subprocess.run(
-        [
-            TSHARK,
-            "-r",
-            str(path),
-            "-Y",
-            rule["base_filter"],
-            "-T",
-            "fields",
-            "-e",
-            "frame.time_relative",
-            "-e",
-            "frame.number",
-            "-e",
-            "ecat.data",
-            "-E",
-            "separator=\x1f",
-            "-E",
-            "occurrence=a",
-            "-E",
-            "quote=n",
-        ],
-        capture_output=True,
-        text=True,
-        errors="replace",
-    )
+    try:
+        proc = subprocess.run(
+            [
+                TSHARK,
+                "-r",
+                str(path),
+                "-Y",
+                rule["base_filter"],
+                "-T",
+                "fields",
+                "-e",
+                "frame.time_relative",
+                "-e",
+                "frame.number",
+                "-e",
+                "ecat.data",
+                "-E",
+                "separator=\x1f",
+                "-E",
+                "occurrence=a",
+                "-E",
+                "quote=n",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError:
+        return {"filter": raw_filter, "error": f"找不到 {TSHARK}，請確認已安裝 Wireshark", "events": [], "is_pdo": True}
 
     if proc.returncode != 0 and not proc.stdout.strip():
         message = ""
@@ -431,34 +536,38 @@ def scan_channel(path, display_filter):
     if display_filter.lower().startswith("pdo:"):
         return scan_ecat_pdo_channel(path, display_filter)
 
-    proc = subprocess.run(
-        [
-            TSHARK,
-            "-r",
-            str(path),
-            "-Y",
-            display_filter,
-            "-T",
-            "fields",
-            "-e",
-            "frame.time_relative",
-            "-e",
-            "frame.number",
-            "-e",
-            "_ws.col.Protocol",
-            "-e",
-            "_ws.col.Info",
-            "-E",
-            "separator=\x1f",
-            "-E",
-            "occurrence=f",
-            "-E",
-            "quote=n",
-        ],
-        capture_output=True,
-        text=True,
-        errors="replace",
-    )
+    try:
+        proc = subprocess.run(
+            [
+                TSHARK,
+                "-r",
+                str(path),
+                "-Y",
+                display_filter,
+                "-T",
+                "fields",
+                "-e",
+                "frame.time_relative",
+                "-e",
+                "frame.number",
+                "-e",
+                "_ws.col.Protocol",
+                "-e",
+                "_ws.col.Info",
+                "-E",
+                "separator=\x1f",
+                "-E",
+                "occurrence=f",
+                "-E",
+                "quote=n",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError:
+        return {"filter": display_filter, "error": f"找不到 {TSHARK}，請確認已安裝 Wireshark", "events": []}
     if proc.returncode != 0 and not proc.stdout.strip():
         message = ""
         for line in proc.stderr.splitlines():
@@ -916,10 +1025,6 @@ LIVE_UI_INJECTION = """
 """
 
 
-class ReusableThreadingHTTPServer(ThreadingHTTPServer):
-    allow_reuse_address = True
-
-
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("%s\n" % (fmt % args))
@@ -1038,6 +1143,12 @@ def kill_previous_instance(port):
         time.sleep(0.2)
 
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
     if not STATIC.joinpath("index.html").is_file():
         sys.exit("缺少 static/index.html")
     
