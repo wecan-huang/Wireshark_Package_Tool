@@ -285,7 +285,7 @@ def capture_meta(path, fallback_duration=None):
     return {"file": path.name, "packets": packets, "duration": duration}
 
 
-# --- EtherCAT PDO 解析與波形點位產生引擎 (一律 Little-Endian) ---
+# --- EtherCAT PDO / USB CDC 解析與波形點位產生引擎 ---
 PDO_TYPES = {
     "bit": (1, None),
     "bool": (1, None),
@@ -304,6 +304,65 @@ PDO_TYPES = {
 }
 
 
+def split_rule_parts(body):
+    """依單一 '|' 分隔語法區塊，保留 Wireshark 過濾條件內的 '||' 運算子。"""
+    return [p.strip() for p in re.split(r"(?<!\|)\|(?!\|)", body)]
+
+
+def resolve_dtype(dtype_str, endian="le"):
+    d = (dtype_str or "uint16").strip().lower()
+    e = (endian or "le").strip().lower()
+    if e in ("be", "big", "big-endian", "big_endian"):
+        byteorder = "big"
+    elif e in ("le", "little", "little-endian", "little_endian", ""):
+        byteorder = "little"
+    else:
+        raise ValueError(f"不支援的端序設定: {endian} (僅支援 le 或 be)")
+
+    if d.endswith("_be"):
+        d = d[:-3]
+        byteorder = "big"
+    elif d.endswith("_le"):
+        d = d[:-3]
+        byteorder = "little"
+
+    if d not in PDO_TYPES:
+        raise ValueError(f"不支援的資料格式: {dtype_str} (支援 bit, uint8~64, int8~64, float, double, hex, frame)")
+
+    length, le_fmt = PDO_TYPES[d]
+    if le_fmt is None:
+        return d, length, None, byteorder
+    prefix = ">" if byteorder == "big" else "<"
+    return d, length, prefix + le_fmt[1:], byteorder
+
+
+def decode_typed_value(raw_bytes, byte_offset, length, dtype, bit_idx=None, endian="le"):
+    start = byte_offset
+    end = start + length
+    if len(raw_bytes) < end:
+        return None
+
+    chunk = raw_bytes[start:end]
+    if dtype in ("bit", "bool"):
+        b_idx = bit_idx if bit_idx is not None else 0
+        val = (chunk[0] >> b_idx) & 1
+        return float(val), f"{val}"
+
+    byteorder = "big" if str(endian).lower().startswith("b") else "little"
+    if dtype in ("hex", "bytes"):
+        formatted = ":".join(f"{b:02x}" for b in chunk)
+        num_val = float(int.from_bytes(chunk, byteorder))
+        return num_val, formatted
+
+    _, _, fmt, _ = resolve_dtype(dtype, byteorder)
+    val = struct.unpack(fmt, chunk)[0]
+    if dtype in ("float", "float32", "double", "float64"):
+        if val != val or abs(val) == float("inf"):
+            return None
+        return round(float(val), 6), f"{val:.4f}"
+    return float(val), str(val)
+
+
 def parse_pdo_rule(raw_filter):
     """
     解析 pdo: 語法
@@ -312,7 +371,7 @@ def parse_pdo_rule(raw_filter):
     格式 3 (原始 Hex): pdo: <基礎過濾> | <byte_offset>:<length> | hex [| <datagram_index>]
     """
     body = raw_filter[4:].strip()
-    parts = [p.strip() for p in body.split("|")]
+    parts = split_rule_parts(body)
     if len(parts) < 2:
         raise ValueError("PDO 語法錯誤，格式: pdo: 過濾條件 | Byte位置[.Bit位置] | 資料格式 [| Datagram序號]")
 
@@ -369,29 +428,524 @@ def decode_ecat_value(hex_str, rule):
     except ValueError:
         return None
 
-    start = rule["byte_offset"]
-    end = start + rule["length"]
-    if len(raw_bytes) < end:
-        return None
+    return decode_typed_value(
+        raw_bytes,
+        rule["byte_offset"],
+        rule["length"],
+        rule["dtype"],
+        bit_idx=rule["bit_idx"],
+        endian="little",
+    )
 
-    chunk = raw_bytes[start:end]
-    dtype = rule["dtype"]
 
-    if dtype in ("bit", "bool"):
-        bit_idx = rule["bit_idx"] if rule["bit_idx"] is not None else 0
-        val = (chunk[0] >> bit_idx) & 1
-        return float(val), f"{val}"
+def parse_hex_bytes(text, label="Hex"):
+    cleaned = text.strip()
+    if cleaned.lower().startswith("0x"):
+        cleaned = cleaned[2:]
+    cleaned = cleaned.replace(":", "").replace("-", "").replace(" ", "")
+    if not cleaned:
+        raise ValueError(f"{label} 不可為空")
+    if len(cleaned) % 2 != 0:
+        raise ValueError(f"{label} 長度必須為偶數個 Hex 字元: {text}")
+    try:
+        return bytes.fromhex(cleaned)
+    except ValueError:
+        raise ValueError(f"{label} 格式錯誤 (非有效 Hex): {text}")
 
-    if dtype in ("hex", "bytes"):
-        formatted = ":".join(f"{b:02x}" for b in chunk)
-        num_val = float(int.from_bytes(chunk, "little"))
-        return num_val, formatted
 
-    _, fmt = PDO_TYPES[dtype]
-    val = struct.unpack(fmt, chunk)[0]
-    if dtype in ("float", "float32", "double", "float64"):
-        return round(float(val), 6), f"{val:.4f}"
-    return float(val), str(val)
+def parse_framing_spec(spec_str):
+    """
+    解析 USB CDC 切幀規則字串 (以 ',' 分隔 key=value)。
+    支援參數: head, tail, len, len_off, len_size, len_bias, len_endian, gap, match, ts, field
+    """
+    spec = {
+        "enabled": False,
+        "head": b"",
+        "tail": b"",
+        "fixed_len": None,
+        "len_off": None,
+        "len_size": 1,
+        "len_bias": 0,
+        "len_endian": "little",
+        "gap_ms": None,
+        "matches": [],
+        "ts": "end",
+        "field": "usb.capdata",
+    }
+    raw = (spec_str or "").strip()
+    if not raw or raw.lower() in ("none", "raw"):
+        return spec
+
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"切幀參數格式錯誤，應為 key=value: {item}")
+        key, val = [x.strip() for x in item.split("=", 1)]
+        k = key.lower()
+        if k in ("head", "header"):
+            spec["head"] = parse_hex_bytes(val, "幀頭 (head)") if val else b""
+        elif k in ("tail", "footer"):
+            spec["tail"] = parse_hex_bytes(val, "幀尾 (tail)") if val else b""
+        elif k in ("len", "length"):
+            v = int(val, 0)
+            if v <= 0:
+                raise ValueError("固定長度 (len) 必須 > 0")
+            spec["fixed_len"] = v
+        elif k in ("len_off", "len_offset"):
+            v = int(val, 0)
+            if v < 0:
+                raise ValueError("動態長度偏移 (len_off) 必須 >= 0")
+            spec["len_off"] = v
+        elif k == "len_size":
+            v = int(val, 0)
+            if v not in (1, 2):
+                raise ValueError("動態長度位元組數 (len_size) 僅支援 1 或 2")
+            spec["len_size"] = v
+        elif k == "len_bias":
+            spec["len_bias"] = int(val, 0)
+        elif k == "len_endian":
+            lv = val.lower()
+            if lv in ("be", "big"):
+                spec["len_endian"] = "big"
+            elif lv in ("le", "little"):
+                spec["len_endian"] = "little"
+            else:
+                raise ValueError("len_endian 僅支援 le 或 be")
+        elif k in ("gap", "timeout"):
+            v = float(val)
+            if v <= 0:
+                raise ValueError("超時分幀 (gap) 必須 > 0 ms")
+            spec["gap_ms"] = v
+        elif k == "match":
+            if val:
+                for sub in val.split(";"):
+                    sub = sub.strip()
+                    if not sub:
+                        continue
+                    if ":" not in sub:
+                        raise ValueError(f"match 格式錯誤，應為 offset:hex (例如 1:01): {sub}")
+                    off_s, hex_s = sub.split(":", 1)
+                    off = int(off_s.strip(), 0)
+                    if off < 0:
+                        raise ValueError("match 偏移量必須 >= 0")
+                    spec["matches"].append((off, parse_hex_bytes(hex_s, "match 比對值")))
+        elif k == "ts":
+            tv = val.lower()
+            if tv not in ("start", "end"):
+                raise ValueError("ts 僅支援 start 或 end")
+            spec["ts"] = tv
+        elif k == "field":
+            if not val or not re.match(r"^[A-Za-z0-9_.-]+$", val):
+                raise ValueError(f"不合法的擷取欄位名稱: {val}")
+            spec["field"] = val
+        else:
+            raise ValueError(f"不支援的切幀參數: {key}")
+
+    if spec["fixed_len"] is not None and spec["len_off"] is not None:
+        raise ValueError("固定長度 (len) 與動態長度偏移 (len_off) 不可同時指定")
+    if spec["fixed_len"] is not None and spec["fixed_len"] < len(spec["head"]) + len(spec["tail"]):
+        raise ValueError("固定長度 (len) 不可小於幀頭與幀尾長度總和")
+
+    spec["enabled"] = any(
+        [
+            bool(spec["head"]),
+            bool(spec["tail"]),
+            spec["fixed_len"] is not None,
+            spec["len_off"] is not None,
+            spec["gap_ms"] is not None,
+        ]
+    )
+    return spec
+
+
+def parse_usb_cdc_rule(raw_filter):
+    """
+    解析 cdc: 與 usb: 語法
+    cdc: <基礎過濾> | <切幀規則> [| <byte_offset(.bit/:len/frame)> [| <type>] [| <le/be>]]
+    usb: <基礎過濾> | <byte_offset(.bit/:len/frame)> [| <type>] [| <le/be>]
+    """
+    is_cdc = raw_filter.lower().startswith("cdc:")
+    body = raw_filter[4:].strip()
+    parts = split_rule_parts(body)
+
+    use_framing = is_cdc or (len(parts) >= 3 and "=" in parts[1])
+    if use_framing:
+        if len(parts) < 2:
+            raise ValueError("CDC 語法錯誤，格式: cdc: 過濾條件 | 切幀規則 | Byte位置(或 frame) | 資料格式 [| le/be]")
+        framing = parse_framing_spec(parts[1])
+        offset_spec = parts[2] if len(parts) >= 3 and parts[2] else "frame"
+        default_dtype = "frame" if offset_spec.lower() in ("frame", "*") else "uint16"
+        dtype_raw = parts[3].lower() if len(parts) >= 4 and parts[3] else default_dtype
+        endian_raw = parts[4].lower() if len(parts) >= 5 and parts[4] else "le"
+    else:
+        if len(parts) < 2:
+            raise ValueError("USB 語法錯誤，格式: usb: 過濾條件 | Byte位置(或 frame) | 資料格式 [| le/be]")
+        framing = parse_framing_spec("")
+        offset_spec = parts[1] or "frame"
+        default_dtype = "frame" if offset_spec.lower() in ("frame", "*") else "uint16"
+        dtype_raw = parts[2].lower() if len(parts) >= 3 and parts[2] else default_dtype
+        endian_raw = parts[3].lower() if len(parts) >= 4 and parts[3] else "le"
+
+    base_filter = parts[0] or framing["field"]
+    bit_idx = None
+    length = 0
+    endian = "little"
+
+    if offset_spec.lower() in ("frame", "*") or dtype_raw == "frame":
+        dtype = "frame"
+        byte_offset = 0
+    elif "." in offset_spec:
+        b_str, bit_str = offset_spec.split(".", 1)
+        byte_offset = int(b_str, 0)
+        bit_idx = int(bit_str, 0)
+        if not (0 <= bit_idx <= 7):
+            raise ValueError("Bit 索引必須在 0 到 7 之間")
+        dtype = "bit"
+        length = 1
+    elif ":" in offset_spec:
+        b_str, len_str = offset_spec.split(":", 1)
+        byte_offset = int(b_str, 0)
+        length = int(len_str, 0)
+        dtype = "hex"
+        _, _, _, endian = resolve_dtype("uint8", endian_raw)
+    else:
+        byte_offset = int(offset_spec, 0)
+        dtype, length, _, endian = resolve_dtype(dtype_raw, endian_raw)
+
+    if byte_offset < 0 or (dtype != "frame" and length <= 0):
+        raise ValueError("Byte 偏移量必須 >= 0 且長度 > 0")
+
+    return {
+        "mode": "cdc" if framing["enabled"] else "usb",
+        "base_filter": base_filter,
+        "framing": framing,
+        "byte_offset": byte_offset,
+        "bit_idx": bit_idx,
+        "length": length,
+        "dtype": dtype,
+        "endian": endian,
+    }
+
+
+def matches_frame(frame_bytes, matches):
+    for off, expected in matches:
+        end = off + len(expected)
+        if len(frame_bytes) < end or frame_bytes[off:end] != expected:
+            return False
+    return True
+
+
+def reassemble_cdc_stream(chunks, framing):
+    """
+    依切幀規則重組連續的 Byte 串流，產生 (t_rel, frame_num, frame_bytes, frag_count)。
+    支援固定長度、動態長度、幀頭/幀尾界定、純幀頭、超時分幀、內容比對及斷線重同步。
+    """
+    matches = framing["matches"]
+    if not framing["enabled"]:
+        for t_rel, f_num, payload in chunks:
+            if payload and matches_frame(payload, matches):
+                yield (t_rel, f_num, payload, 1)
+        return
+
+    head = framing["head"]
+    tail = framing["tail"]
+    fixed_len = framing["fixed_len"]
+    len_off = framing["len_off"]
+    len_size = framing["len_size"]
+    len_bias = framing["len_bias"]
+    len_endian = framing["len_endian"]
+    gap_ms = framing["gap_ms"]
+    ts_mode = framing["ts"]
+
+    is_head_only = bool(head) and not tail and fixed_len is None and len_off is None
+    is_gap_only = not head and not tail and fixed_len is None and len_off is None and gap_ms is not None
+
+    buf = bytearray()
+    byte_meta = []
+    last_chunk_t = None
+
+    def emit_slice(start, end):
+        frame = bytes(buf[start:end])
+        if not frame or not matches_frame(frame, matches):
+            return None
+        t_rel, f_num = byte_meta[start] if ts_mode == "start" else byte_meta[end - 1]
+        frag_count = len({fn for _, fn in byte_meta[start:end]})
+        return (t_rel, f_num, frame, frag_count)
+
+    def drain_ready():
+        results = []
+        pos = 0
+        n = len(buf)
+        while pos < n:
+            if head:
+                idx = buf.find(head, pos)
+                if idx == -1:
+                    if len(head) > 1:
+                        pos = max(pos, n - (len(head) - 1))
+                    else:
+                        pos = n
+                    break
+                pos = idx
+
+            if fixed_len is not None:
+                if n - pos < fixed_len:
+                    break
+                if tail and buf[pos + fixed_len - len(tail) : pos + fixed_len] != tail:
+                    pos += 1
+                    continue
+                ev = emit_slice(pos, pos + fixed_len)
+                if ev is not None:
+                    results.append(ev)
+                pos += fixed_len
+            elif len_off is not None:
+                if n - pos < len_off + len_size:
+                    break
+                total_len = int.from_bytes(buf[pos + len_off : pos + len_off + len_size], len_endian) + len_bias
+                min_valid = max(len(head) + len(tail), len_off + len_size, 1)
+                if total_len < min_valid or total_len > 65536:
+                    pos += 1
+                    continue
+                if n - pos < total_len:
+                    break
+                if tail and buf[pos + total_len - len(tail) : pos + total_len] != tail:
+                    pos += 1
+                    continue
+                ev = emit_slice(pos, pos + total_len)
+                if ev is not None:
+                    results.append(ev)
+                pos += total_len
+            elif tail:
+                t_idx = buf.find(tail, pos + len(head))
+                if t_idx == -1:
+                    break
+                end = t_idx + len(tail)
+                ev = emit_slice(pos, end)
+                if ev is not None:
+                    results.append(ev)
+                pos = end
+            elif is_head_only:
+                next_idx = buf.find(head, pos + len(head))
+                if next_idx == -1:
+                    break
+                ev = emit_slice(pos, next_idx)
+                if ev is not None:
+                    results.append(ev)
+                pos = next_idx
+            else:
+                break
+
+        if pos > 0:
+            del buf[:pos]
+            del byte_meta[:pos]
+        if len(buf) > 262144:
+            drop = len(buf) // 2
+            del buf[:drop]
+            del byte_meta[:drop]
+        return results
+
+    for t_rel, f_num, payload in chunks:
+        if not payload:
+            continue
+        if gap_ms is not None and last_chunk_t is not None and (t_rel - last_chunk_t) * 1000.0 > gap_ms and buf:
+            if is_gap_only or (is_head_only and buf.startswith(head)):
+                ev = emit_slice(0, len(buf))
+                if ev is not None:
+                    yield ev
+            buf.clear()
+            byte_meta.clear()
+
+        buf.extend(payload)
+        byte_meta.extend([(t_rel, f_num)] * len(payload))
+        last_chunk_t = t_rel
+        for ev in drain_ready():
+            yield ev
+
+    if buf and (is_gap_only or (is_head_only and buf.startswith(head))):
+        ev = emit_slice(0, len(buf))
+        if ev is not None:
+            yield ev
+
+
+def scan_usb_cdc_channel(path, raw_filter):
+    try:
+        rule = parse_usb_cdc_rule(raw_filter)
+    except ValueError as exc:
+        return {"filter": raw_filter, "error": str(exc), "events": []}
+
+    is_waveform = rule["dtype"] != "frame"
+    framing = rule["framing"]
+
+    try:
+        proc = subprocess.run(
+            [
+                TSHARK,
+                "-r",
+                str(path),
+                "-Y",
+                rule["base_filter"],
+                "-T",
+                "fields",
+                "-e",
+                "frame.time_relative",
+                "-e",
+                "frame.number",
+                "-e",
+                framing["field"],
+                "-E",
+                "separator=\x1f",
+                "-E",
+                "occurrence=a",
+                "-E",
+                "quote=n",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError:
+        err_res = {"filter": raw_filter, "error": f"找不到 {TSHARK}，請確認已安裝 Wireshark", "events": []}
+        if is_waveform:
+            err_res["is_pdo"] = True
+        return err_res
+
+    if proc.returncode != 0 and not proc.stdout.strip():
+        message = ""
+        for line in proc.stderr.splitlines():
+            line = line.strip()
+            if line.startswith("tshark:"):
+                message = line[len("tshark:") :].strip()
+                break
+        if not message:
+            message = proc.stderr.strip() or "過濾指令無法執行"
+        if "cut short" not in message.lower():
+            err_res = {"filter": raw_filter, "error": message, "events": []}
+            if is_waveform:
+                err_res["is_pdo"] = True
+            return err_res
+
+    def iter_chunks():
+        for line in proc.stdout.splitlines():
+            parts = line.split("\x1f")
+            if len(parts) < 3 or not parts[0] or not parts[2]:
+                continue
+            try:
+                t_rel = float(parts[0])
+                f_num = int(float(parts[1]))
+            except ValueError:
+                continue
+            for item in parts[2].split(","):
+                clean_hex = item.strip().replace(":", "").replace("-", "").replace(" ", "")
+                if not clean_hex:
+                    continue
+                try:
+                    payload = bytes.fromhex(clean_hex)
+                except ValueError:
+                    continue
+                if payload:
+                    yield (t_rel, f_num, payload)
+
+    frames = reassemble_cdc_stream(iter_chunks(), framing)
+    proto_tag = "CDC" if framing["enabled"] else "USB"
+
+    if not is_waveform:
+        events = []
+        for t_rel, f_num, frame, frag_count in frames:
+            frag_tag = f"[重組{frag_count}包]" if frag_count > 1 else ""
+            preview = frame[:24].hex()
+            if len(frame) > 24:
+                preview += "..."
+            events.append(
+                {
+                    "t": t_rel,
+                    "n": f_num,
+                    "proto": proto_tag,
+                    "info": f"[{len(frame)}B]{frag_tag} {preview}"[:180],
+                }
+            )
+        return {"filter": raw_filter, "error": None, "events": events}
+
+    loc_label = f"{proto_tag} Byte[{rule['byte_offset']}]"
+    if rule["bit_idx"] is not None:
+        loc_label += f".Bit[{rule['bit_idx']}]"
+    elif rule["length"] > 1:
+        loc_label = f"{proto_tag} Byte[{rule['byte_offset']}:{rule['byte_offset'] + rule['length'] - 1}]"
+
+    events = []
+    last_val = None
+    last_str = None
+    last_t = None
+    last_n = None
+    has_initialized = False
+
+    for t_rel, f_num, frame, frag_count in frames:
+        decoded = decode_typed_value(
+            frame,
+            rule["byte_offset"],
+            rule["length"],
+            rule["dtype"],
+            bit_idx=rule["bit_idx"],
+            endian=rule["endian"],
+        )
+        if decoded is None:
+            continue
+        val, val_str = decoded
+        frag_tag = f" [重組{frag_count}包]" if frag_count > 1 else ""
+
+        if not has_initialized:
+            has_initialized = True
+            last_val = val
+            last_str = val_str
+            events.append(
+                {
+                    "t": t_rel,
+                    "n": f_num,
+                    "val": val,
+                    "val_str": val_str,
+                    "proto": f"{proto_tag}({rule['dtype']})",
+                    "info": f"[初始] {loc_label} = {val_str}{frag_tag}",
+                }
+            )
+        elif val != last_val:
+            events.append(
+                {
+                    "t": t_rel,
+                    "n": f_num,
+                    "val": val,
+                    "val_str": val_str,
+                    "proto": f"{proto_tag}({rule['dtype']})",
+                    "info": f"{loc_label}: {last_str} -> {val_str}{frag_tag}",
+                }
+            )
+            last_val = val
+            last_str = val_str
+
+        last_t = t_rel
+        last_n = f_num
+
+    if has_initialized and last_t is not None and (not events or events[-1]["t"] < last_t):
+        events.append(
+            {
+                "t": last_t,
+                "n": last_n,
+                "val": last_val,
+                "val_str": last_str,
+                "proto": f"{proto_tag}({rule['dtype']})",
+                "info": f"[維持] {loc_label} = {last_str}",
+                "is_hold": True,
+            }
+        )
+
+    return {
+        "filter": raw_filter,
+        "error": None,
+        "events": events,
+        "is_pdo": True,
+        "dtype": rule["dtype"],
+        "loc_label": loc_label,
+    }
 
 
 def scan_ecat_pdo_channel(path, raw_filter):
@@ -530,11 +1084,14 @@ def scan_channel(path, display_filter):
     display_filter = display_filter.replace("\x00", "").strip()
     if not display_filter:
         return {"filter": "", "error": None, "events": []}
-    if len(display_filter) > 500:
+    if len(display_filter) > 1000:
         return {"filter": display_filter, "error": "過濾指令過長", "events": []}
 
-    if display_filter.lower().startswith("pdo:"):
+    low = display_filter.lower()
+    if low.startswith("pdo:"):
         return scan_ecat_pdo_channel(path, display_filter)
+    if low.startswith("cdc:") or low.startswith("usb:"):
+        return scan_usb_cdc_channel(path, display_filter)
 
     try:
         proc = subprocess.run(
@@ -631,39 +1188,71 @@ LIVE_UI_INJECTION = """
     </select>
     <button id="live-toggle-btn" style="background:#10b981;color:#fff;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-weight:bold;">開始即時監控</button>
     <span id="live-status" style="color:#94a3b8;">待機中</span>
-    <button id="pdo-helper-toggle" style="margin-left:auto;background:#0284c7;color:#fff;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-weight:bold;">📈 EtherCAT PDO 數值波形產生器</button>
+    <button id="pdo-helper-toggle" style="margin-left:auto;background:#0284c7;color:#fff;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-weight:bold;">📈 波形與切幀規則產生器 (PDO / USB CDC)</button>
   </div>
 
   <div id="pdo-helper-panel" style="display:none;margin-top:10px;padding-top:10px;border-top:1px dashed #475569;align-items:center;gap:8px;flex-wrap:wrap;">
-    <span style="color:#fbbf24;font-weight:bold;">PDO 波形設定：</span>
-    <input id="pdo-base" type="text" value="ecat" placeholder="基礎過濾 (如 ecat.ado == 0x1000)" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px 8px;border-radius:4px;width:190px;">
-    <label>Byte 起始:<input id="pdo-byte" type="number" min="0" value="0" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px;border-radius:4px;width:55px;margin-left:4px;"></label>
+    <span style="color:#fbbf24;font-weight:bold;">波形設定：</span>
+    <label>來源:
+      <select id="pdo-mode" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px;border-radius:4px;margin-left:4px;">
+        <option value="pdo" selected>EtherCAT PDO (pdo:)</option>
+        <option value="cdc">USB CDC 串流重組 (cdc:)</option>
+        <option value="usb">USB 逐包解析 (usb:)</option>
+      </select>
+    </label>
+    <input id="pdo-base" type="text" value="ecat" placeholder="基礎過濾 (如 ecat.ado == 0x1000 或 usb.capdata)" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px 8px;border-radius:4px;width:230px;">
+    <label id="pdo-byte-wrap">Byte 起始:<input id="pdo-byte" type="number" min="0" value="0" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px;border-radius:4px;width:55px;margin-left:4px;"></label>
     <label>資料格式:
       <select id="pdo-dtype" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px;border-radius:4px;margin-left:4px;">
+        <option value="frame">frame (僅重組封包脈衝)</option>
         <option value="bit">bit (單一 Bit 0/1)</option>
         <option value="uint8">uint8 (1 Byte 無號)</option>
         <option value="int8">int8 (1 Byte 有號)</option>
-        <option value="uint16" selected>uint16 (2 Bytes LE)</option>
-        <option value="int16">int16 (2 Bytes LE)</option>
-        <option value="uint32">uint32 (4 Bytes LE)</option>
-        <option value="int32">int32 (4 Bytes LE)</option>
-        <option value="float">float (4 Bytes LE)</option>
-        <option value="double">double (8 Bytes LE)</option>
+        <option value="uint16" selected>uint16 (2 Bytes)</option>
+        <option value="int16">int16 (2 Bytes)</option>
+        <option value="uint32">uint32 (4 Bytes)</option>
+        <option value="int32">int32 (4 Bytes)</option>
+        <option value="float">float (4 Bytes)</option>
+        <option value="double">double (8 Bytes)</option>
         <option value="hex">hex (自訂 Byte 長度)</option>
       </select>
     </label>
     <label id="pdo-bit-wrap" style="display:none;">Bit(0-7):<input id="pdo-bit" type="number" min="0" max="7" value="0" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px;border-radius:4px;width:45px;margin-left:4px;"></label>
     <label id="pdo-len-wrap" style="display:none;">長度:<input id="pdo-len" type="number" min="1" value="2" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px;border-radius:4px;width:45px;margin-left:4px;"></label>
-    <label>Datagram序號:<input id="pdo-dg" type="number" min="0" value="0" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px;border-radius:4px;width:45px;margin-left:4px;" title="單一Frame有多個Datagram時指定序號(從0起算)"></label>
+    <label id="cdc-endian-wrap" style="display:none;">端序:
+      <select id="cdc-endian" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px;border-radius:4px;margin-left:4px;">
+        <option value="le" selected>Little-Endian</option>
+        <option value="be">Big-Endian</option>
+      </select>
+    </label>
+    <label id="pdo-dg-wrap">Datagram序號:<input id="pdo-dg" type="number" min="0" value="0" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px;border-radius:4px;width:45px;margin-left:4px;" title="單一Frame有多個Datagram時指定序號(從0起算)"></label>
     <button id="pdo-copy-btn" style="background:#10b981;color:#fff;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-weight:bold;">填入空白頻道並掃描</button>
     <span id="pdo-preview" style="color:#38bdf8;font-family:monospace;"></span>
+
+    <div id="cdc-framing-row" style="display:none;width:100%;padding-top:8px;border-top:1px dashed #334155;align-items:center;gap:8px;flex-wrap:wrap;">
+      <span style="color:#38bdf8;font-weight:bold;">USB CDC 切幀規則：</span>
+      <label>幀頭 Hex:<input id="cdc-head" type="text" placeholder="如 ff 或 aa55" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px 6px;border-radius:4px;width:85px;margin-left:4px;"></label>
+      <label>幀尾 Hex:<input id="cdc-tail" type="text" placeholder="如 ee 或 0d0a" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px 6px;border-radius:4px;width:85px;margin-left:4px;"></label>
+      <label>固定長度:<input id="cdc-len" type="number" min="1" placeholder="如 27" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px;border-radius:4px;width:60px;margin-left:4px;"></label>
+      <label>動態長度偏移:<input id="cdc-len-off" type="number" min="0" placeholder="選填" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px;border-radius:4px;width:55px;margin-left:4px;"></label>
+      <label>長度偏差:<input id="cdc-len-bias" type="number" value="0" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px;border-radius:4px;width:50px;margin-left:4px;" title="總幀長 = 長度欄位值 + 偏差"></label>
+      <label>超時分幀(ms):<input id="cdc-gap" type="number" step="0.1" min="0.1" placeholder="選填" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px;border-radius:4px;width:65px;margin-left:4px;"></label>
+      <label>內容比對:<input id="cdc-match" type="text" placeholder="如 1:01" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px 6px;border-radius:4px;width:85px;margin-left:4px;" title="offset:hex，多組可用分號分隔如 1:01;2:00"></label>
+      <label>時間戳:
+        <select id="cdc-ts" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px;border-radius:4px;margin-left:4px;">
+          <option value="end" selected>收齊封包 (end)</option>
+          <option value="start">首包到達 (start)</option>
+        </select>
+      </label>
+      <label>擷取欄位:<input id="cdc-field" type="text" value="usb.capdata" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px 6px;border-radius:4px;width:95px;margin-left:4px;"></label>
+    </div>
   </div>
 </div>
 
-<!-- 浮動數值波形檢視視窗：自動為所有 PDO 頻道繪製真實 Y 軸數值階梯曲線 -->
+<!-- 浮動數值波形檢視視窗：自動為所有 PDO / USB CDC 頻道繪製真實 Y 軸數值階梯曲線 -->
 <div id="pdo-scope-dock" style="display:none;flex-shrink:0;background:#0b1120;color:#e2e8f0;padding:12px 16px;border-bottom:2px solid #0284c7;font-family:system-ui,sans-serif;">
   <div style="display:flex;align-items:center;gap:8px;justify-content:space-between;margin-bottom:8px;flex-wrap:wrap;">
-    <strong style="color:#38bdf8;font-size:14px;">📊 EtherCAT PDO 數值波形示波器 (Y軸：實際工程數值 / X軸：相對時間)</strong>
+    <strong style="color:#38bdf8;font-size:14px;">📊 數位波形示波器 (EtherCAT PDO / USB CDC) (Y軸：實際工程數值 / X軸：相對時間)</strong>
     <div style="display:flex;align-items:center;gap:6px;">
       <button id="pdo-full-btn" type="button" style="background:#1e293b;color:#e2e8f0;border:1px solid #475569;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:12px;">全程</button>
       <button id="pdo-measure-btn" type="button" title="開啟後拖曳建立時間測量區塊（平時亦可按住 Shift+拖曳）" style="background:#1e293b;color:#e2e8f0;border:1px solid #475569;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:12px;">📏 測量</button>
@@ -688,14 +1277,29 @@ LIVE_UI_INJECTION = """
   const statusSpan = document.getElementById('live-status');
   const helperToggle = document.getElementById('pdo-helper-toggle');
   const helperPanel = document.getElementById('pdo-helper-panel');
+  const pdoMode = document.getElementById('pdo-mode');
   const pdoBase = document.getElementById('pdo-base');
+  const pdoByteWrap = document.getElementById('pdo-byte-wrap');
   const pdoByte = document.getElementById('pdo-byte');
   const pdoDtype = document.getElementById('pdo-dtype');
   const pdoBitWrap = document.getElementById('pdo-bit-wrap');
   const pdoBit = document.getElementById('pdo-bit');
   const pdoLenWrap = document.getElementById('pdo-len-wrap');
   const pdoLen = document.getElementById('pdo-len');
+  const cdcEndianWrap = document.getElementById('cdc-endian-wrap');
+  const cdcEndian = document.getElementById('cdc-endian');
+  const pdoDgWrap = document.getElementById('pdo-dg-wrap');
   const pdoDg = document.getElementById('pdo-dg');
+  const cdcFramingRow = document.getElementById('cdc-framing-row');
+  const cdcHead = document.getElementById('cdc-head');
+  const cdcTail = document.getElementById('cdc-tail');
+  const cdcLen = document.getElementById('cdc-len');
+  const cdcLenOff = document.getElementById('cdc-len-off');
+  const cdcLenBias = document.getElementById('cdc-len-bias');
+  const cdcGap = document.getElementById('cdc-gap');
+  const cdcMatch = document.getElementById('cdc-match');
+  const cdcTs = document.getElementById('cdc-ts');
+  const cdcField = document.getElementById('cdc-field');
   const pdoCopyBtn = document.getElementById('pdo-copy-btn');
   const pdoPreview = document.getElementById('pdo-preview');
 
@@ -1498,26 +2102,130 @@ LIVE_UI_INJECTION = """
     updatePdoPreview();
   });
 
+  const CDC_STORAGE_KEY = 'packet-scope-cdc-framing';
+
+  function saveCdcSettings() {
+    try {
+      localStorage.setItem(CDC_STORAGE_KEY, JSON.stringify({
+        mode: pdoMode.value,
+        base: pdoBase.value,
+        endian: cdcEndian.value,
+        head: cdcHead.value,
+        tail: cdcTail.value,
+        len: cdcLen.value,
+        lenOff: cdcLenOff.value,
+        lenBias: cdcLenBias.value,
+        gap: cdcGap.value,
+        match: cdcMatch.value,
+        ts: cdcTs.value,
+        field: cdcField.value,
+      }));
+    } catch (e) {}
+  }
+
+  function loadCdcSettings() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(CDC_STORAGE_KEY) || 'null');
+      if (!saved || typeof saved !== 'object') return;
+      if (saved.mode && ['pdo', 'cdc', 'usb'].includes(saved.mode)) pdoMode.value = saved.mode;
+      if (typeof saved.base === 'string' && saved.base.trim()) pdoBase.value = saved.base;
+      if (saved.endian && ['le', 'be'].includes(saved.endian)) cdcEndian.value = saved.endian;
+      if (typeof saved.head === 'string') cdcHead.value = saved.head;
+      if (typeof saved.tail === 'string') cdcTail.value = saved.tail;
+      if (typeof saved.len === 'string') cdcLen.value = saved.len;
+      if (typeof saved.lenOff === 'string') cdcLenOff.value = saved.lenOff;
+      if (typeof saved.lenBias === 'string') cdcLenBias.value = saved.lenBias;
+      if (typeof saved.gap === 'string') cdcGap.value = saved.gap;
+      if (typeof saved.match === 'string') cdcMatch.value = saved.match;
+      if (saved.ts && ['start', 'end'].includes(saved.ts)) cdcTs.value = saved.ts;
+      if (typeof saved.field === 'string' && saved.field.trim()) cdcField.value = saved.field;
+    } catch (e) {}
+  }
+
+  function buildCdcFramingSpec() {
+    const segs = [];
+    const head = cdcHead.value.trim();
+    const tail = cdcTail.value.trim();
+    const fixLen = cdcLen.value.trim();
+    const lenOff = cdcLenOff.value.trim();
+    const lenBias = cdcLenBias.value.trim();
+    const gap = cdcGap.value.trim();
+    const match = cdcMatch.value.trim();
+    const ts = cdcTs.value;
+    const field = cdcField.value.trim();
+    if (head) segs.push(`head=${head}`);
+    if (tail) segs.push(`tail=${tail}`);
+    if (fixLen) segs.push(`len=${fixLen}`);
+    if (lenOff) {
+      segs.push(`len_off=${lenOff}`);
+      if (lenBias && lenBias !== '0') segs.push(`len_bias=${lenBias}`);
+    }
+    if (gap) segs.push(`gap=${gap}`);
+    if (match) segs.push(`match=${match}`);
+    if (ts === 'start') segs.push('ts=start');
+    if (field && field !== 'usb.capdata') segs.push(`field=${field}`);
+    return segs.length > 0 ? segs.join(',') : 'none';
+  }
+
   function buildPdoSyntax() {
-    const base = pdoBase.value.trim() || 'ecat';
+    const mode = pdoMode.value;
+    const defaultBase = mode === 'pdo' ? 'ecat' : (cdcField.value.trim() || 'usb.capdata');
+    const base = pdoBase.value.trim() || defaultBase;
     const byteIdx = parseInt(pdoByte.value || '0', 10);
     const dtype = pdoDtype.value;
-    const dg = parseInt(pdoDg.value || '0', 10);
+    const endian = cdcEndian.value || 'le';
     let offsetPart = `${byteIdx}`;
     if (dtype === 'bit') {
       offsetPart = `${byteIdx}.${parseInt(pdoBit.value || '0', 10)}`;
     } else if (dtype === 'hex') {
       offsetPart = `${byteIdx}:${parseInt(pdoLen.value || '1', 10)}`;
     }
-    return `pdo: ${base} | ${offsetPart} | ${dtype} | ${dg}`;
+
+    if (mode === 'pdo') {
+      const dg = parseInt(pdoDg.value || '0', 10);
+      return `pdo: ${base} | ${offsetPart} | ${dtype} | ${dg}`;
+    }
+    if (mode === 'cdc') {
+      const framing = buildCdcFramingSpec();
+      if (dtype === 'frame') return `cdc: ${base} | ${framing} | frame`;
+      if (dtype === 'bit' || dtype === 'hex') return `cdc: ${base} | ${framing} | ${offsetPart} | ${dtype}`;
+      return `cdc: ${base} | ${framing} | ${offsetPart} | ${dtype} | ${endian}`;
+    }
+    if (dtype === 'frame') return `usb: ${base} | frame`;
+    if (dtype === 'bit' || dtype === 'hex') return `usb: ${base} | ${offsetPart} | ${dtype}`;
+    return `usb: ${base} | ${offsetPart} | ${dtype} | ${endian}`;
   }
 
   function updatePdoPreview() {
+    const mode = pdoMode.value;
+    const frameOpt = pdoDtype.querySelector('option[value="frame"]');
+    if (frameOpt) {
+      frameOpt.hidden = mode === 'pdo';
+      frameOpt.disabled = mode === 'pdo';
+    }
+    if (mode === 'pdo' && pdoDtype.value === 'frame') {
+      pdoDtype.value = 'uint16';
+    }
     const dtype = pdoDtype.value;
+    cdcFramingRow.style.display = mode === 'cdc' ? 'flex' : 'none';
+    pdoDgWrap.style.display = mode === 'pdo' ? 'inline-block' : 'none';
+    cdcEndianWrap.style.display = (mode !== 'pdo' && dtype !== 'frame' && dtype !== 'bit') ? 'inline-block' : 'none';
+    pdoByteWrap.style.display = dtype === 'frame' ? 'none' : 'inline-block';
     pdoBitWrap.style.display = dtype === 'bit' ? 'inline-block' : 'none';
     pdoLenWrap.style.display = dtype === 'hex' ? 'inline-block' : 'none';
     pdoPreview.textContent = buildPdoSyntax();
+    saveCdcSettings();
   }
+
+  pdoMode.addEventListener('change', () => {
+    const curBase = pdoBase.value.trim();
+    if (pdoMode.value === 'pdo') {
+      if (!curBase || curBase === 'usb.capdata') pdoBase.value = 'ecat';
+    } else {
+      if (!curBase || curBase === 'ecat') pdoBase.value = 'usb.capdata';
+    }
+    updatePdoPreview();
+  });
 
   function getChannelFilterInputs() {
     const chInputs = Array.from(document.querySelectorAll('#channels input'));
@@ -1530,7 +2238,10 @@ LIVE_UI_INJECTION = """
     if (runBtn) runBtn.click();
   }
 
-  [pdoBase, pdoByte, pdoDtype, pdoBit, pdoLen, pdoDg].forEach(el => {
+  [
+    pdoBase, pdoByte, pdoDtype, pdoBit, pdoLen, pdoDg,
+    cdcEndian, cdcHead, cdcTail, cdcLen, cdcLenOff, cdcLenBias, cdcGap, cdcMatch, cdcTs, cdcField,
+  ].forEach(el => {
     el.addEventListener('input', updatePdoPreview);
     el.addEventListener('change', updatePdoPreview);
     el.addEventListener('keydown', (e) => {
@@ -1551,6 +2262,9 @@ LIVE_UI_INJECTION = """
       }
     });
   });
+
+  loadCdcSettings();
+  updatePdoPreview();
 
   pdoCopyBtn.addEventListener('click', () => {
     const syntax = buildPdoSyntax();
@@ -1584,9 +2298,9 @@ LIVE_UI_INJECTION = """
 
   function triggerRefreshAndScan() {
     const buttons = Array.from(document.querySelectorAll('button'));
-    const refreshBtn = buttons.find(b => b.textContent.trim() === '重新整理');
-    const scanBtn = buttons.find(b => b.textContent.trim() === '掃描');
-    const fileSelect = document.querySelector('select:not(#live-iface):not(#pdo-dtype)');
+    const refreshBtn = document.getElementById('reload') || buttons.find(b => b.textContent.trim() === '重新整理');
+    const scanBtn = document.getElementById('run') || buttons.find(b => b.textContent.trim() === '掃描');
+    const fileSelect = document.getElementById('file') || Array.from(document.querySelectorAll('select')).find(s => !s.closest('#live-capture-bar'));
 
     if (fileSelect) {
       const hasLiveOption = Array.from(fileSelect.options).some(o => o.value === 'live_capture.pcap');
