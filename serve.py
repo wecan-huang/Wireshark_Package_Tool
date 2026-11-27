@@ -1080,6 +1080,362 @@ def scan_ecat_pdo_channel(path, raw_filter):
     }
 
 
+# --- 不規則週期偵測 (Jitter / Period Anomaly) 解析與分析引擎 ---
+JITTER_PARAM_KEYS = {"period", "target", "tol", "tolerance", "min", "max", "edge", "mode"}
+
+
+def parse_duration_sec(val_str, label="時間"):
+    s = (val_str or "").strip().lower()
+    if not s:
+        raise ValueError(f"{label} 不可為空")
+    scale = 1e-3  # 預設單位 ms
+    if s.endswith("µs") or s.endswith("us"):
+        s = s[:-2].strip()
+        scale = 1e-6
+    elif s.endswith("ms"):
+        s = s[:-2].strip()
+        scale = 1e-3
+    elif s.endswith("s"):
+        s = s[:-1].strip()
+        scale = 1.0
+    try:
+        v = float(s) * scale
+    except ValueError:
+        raise ValueError(f"{label} 格式錯誤: {val_str}")
+    if v != v or abs(v) == float("inf") or v < 0:
+        raise ValueError(f"{label} 必須為 >= 0 的有效數值: {val_str}")
+    return v
+
+
+def parse_jitter_params(spec_str):
+    params = {
+        "period_s": None,
+        "tol_pct": None,
+        "tol_s": None,
+        "min_s": None,
+        "max_s": None,
+        "edge": "auto",
+    }
+    raw = (spec_str or "").strip()
+    if raw:
+        for item in raw.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "=" not in item:
+                raise ValueError(f"週期偵測參數格式錯誤，應為 key=value: {item}")
+            key, val = [x.strip() for x in item.split("=", 1)]
+            k = key.lower()
+            if k in ("period", "target"):
+                if val:
+                    v = parse_duration_sec(val, "目標週期 (period)")
+                    if v <= 0:
+                        raise ValueError("目標週期 (period) 必須 > 0")
+                    params["period_s"] = v
+            elif k in ("tol", "tolerance"):
+                if val.endswith("%"):
+                    try:
+                        pct = float(val[:-1].strip())
+                    except ValueError:
+                        raise ValueError(f"容許誤差百分比格式錯誤: {val}")
+                    if pct < 0 or pct != pct or abs(pct) == float("inf"):
+                        raise ValueError("容許誤差百分比必須 >= 0")
+                    params["tol_pct"] = pct
+                    params["tol_s"] = None
+                elif val:
+                    params["tol_s"] = parse_duration_sec(val, "容許誤差 (tol)")
+                    params["tol_pct"] = None
+            elif k == "min":
+                if val:
+                    params["min_s"] = parse_duration_sec(val, "下限 (min)")
+            elif k == "max":
+                if val:
+                    v = parse_duration_sec(val, "上限 (max)")
+                    if v <= 0:
+                        raise ValueError("上限 (max) 必須 > 0")
+                    params["max_s"] = v
+            elif k in ("edge", "mode"):
+                ev = val.lower()
+                if ev not in ("auto", "rise", "fall", "state", "all"):
+                    raise ValueError(f"不支援的週期模式 (edge): {val} (支援 auto, rise, fall, state, all)")
+                params["edge"] = ev
+            else:
+                raise ValueError(f"不支援的週期偵測參數: {key}")
+
+    if params["min_s"] is not None and params["max_s"] is not None and params["min_s"] > params["max_s"]:
+        raise ValueError("下限 (min) 不可大於上限 (max)")
+
+    if (
+        params["tol_pct"] is None
+        and params["tol_s"] is None
+        and params["min_s"] is None
+        and params["max_s"] is None
+    ):
+        params["tol_pct"] = 20.0
+
+    return params
+
+
+def _is_jitter_param_segment(seg):
+    s = (seg or "").strip()
+    if not s:
+        return False
+    for op in ("==", "!=", ">=", "<=", "&&", "||"):
+        if op in s:
+            return False
+    pieces = [p.strip() for p in s.split(",") if p.strip()]
+    if not pieces:
+        return False
+    for p in pieces:
+        if "=" not in p:
+            return False
+        k = p.split("=", 1)[0].strip().lower()
+        if k not in JITTER_PARAM_KEYS:
+            return False
+    return True
+
+
+def parse_jitter_rule(raw_filter):
+    """
+    解析 jitter: / period: 語法
+    格式 1 (參考現有頻道): jitter: ch3 [| tol=20%,edge=auto]
+    格式 2 (參數在前 + 過濾規則): jitter: tol=20% | <過濾規則>
+    格式 3 (波形規則 + 參數): jitter: <pdo:/cdc:/usb: 規則> [| tol=20%]
+    格式 4 (一般 Wireshark 過濾 + 參數): jitter: <過濾條件> [| tol=20%]
+    """
+    body = raw_filter[7:].strip()
+    if not body:
+        raise ValueError("不規則週期語法錯誤，格式: jitter: ch3 [| tol=20%,edge=auto] 或 jitter: tol=20% | <過濾規則>")
+
+    parts = split_rule_parts(body)
+    first = parts[0]
+
+    m_ch = re.match(r"^ch(\d+)$", first, re.IGNORECASE)
+    if m_ch:
+        ch_num = int(m_ch.group(1))
+        if not (1 <= ch_num <= CHANNEL_COUNT):
+            raise ValueError(f"頻道編號必須介於 ch1 到 ch{CHANNEL_COUNT} 之間")
+        target_ch = ch_num - 1
+        target_filter = None
+        params = parse_jitter_params(parts[1] if len(parts) >= 2 else "")
+    elif len(parts) >= 2 and _is_jitter_param_segment(first):
+        params = parse_jitter_params(first)
+        target_ch = None
+        target_filter = " | ".join(parts[1:]).strip()
+    elif first.lower().startswith(("pdo:", "cdc:", "usb:")):
+        target_ch = None
+        if len(parts) >= 2 and _is_jitter_param_segment(parts[-1]):
+            params = parse_jitter_params(parts[-1])
+            target_filter = " | ".join(parts[:-1]).strip()
+        else:
+            params = parse_jitter_params("")
+            target_filter = body
+    else:
+        target_ch = None
+        target_filter = first
+        params = parse_jitter_params(parts[1] if len(parts) >= 2 else "")
+
+    if target_ch is None and not target_filter:
+        raise ValueError("請指定參考頻道 (如 ch3) 或目標過濾條件")
+
+    return {
+        "target_ch": target_ch,
+        "target_filter": target_filter,
+        "params": params,
+    }
+
+
+def _fmt_ms_label(sec):
+    if sec < 0.001:
+        return f"{sec * 1e6:.0f} µs"
+    if sec < 1.0:
+        return f"{sec * 1000:.2f} ms"
+    return f"{sec:.4f} s"
+
+
+def _median_val(vals):
+    s = sorted(vals)
+    n = len(s)
+    mid = n // 2
+    if n % 2 == 1:
+        return s[mid]
+    return (s[mid - 1] + s[mid]) / 2.0
+
+
+def _compute_jitter_bounds(base_s, params):
+    base = params["period_s"] if params["period_s"] is not None else base_s
+    if params["tol_s"] is not None:
+        lo = max(0.0, base - params["tol_s"])
+        hi = base + params["tol_s"]
+    elif params["tol_pct"] is not None:
+        lo = max(0.0, base * (1.0 - params["tol_pct"] / 100.0))
+        hi = base * (1.0 + params["tol_pct"] / 100.0)
+    else:
+        lo = 0.0
+        hi = float("inf")
+    if params["min_s"] is not None:
+        lo = params["min_s"]
+    if params["max_s"] is not None:
+        hi = params["max_s"]
+    return base, lo, hi
+
+
+def analyze_irregular_periods(source_channel, rule, raw_filter):
+    src_events = [e for e in (source_channel.get("events") or []) if not e.get("is_hold")]
+    has_val = len(src_events) > 0 and "val" in src_events[0]
+    params = rule["params"]
+
+    edge_mode = params["edge"]
+    if edge_mode == "auto":
+        if not has_val:
+            edge_mode = "all"
+        else:
+            rise_cnt = sum(1 for i in range(1, len(src_events)) if src_events[i]["val"] > src_events[i - 1]["val"])
+            fall_cnt = sum(1 for i in range(1, len(src_events)) if src_events[i]["val"] < src_events[i - 1]["val"])
+            if rise_cnt >= 3:
+                edge_mode = "rise"
+            elif fall_cnt >= 3:
+                edge_mode = "fall"
+            else:
+                edge_mode = "all"
+    elif edge_mode in ("rise", "fall", "state") and not has_val:
+        edge_mode = "all"
+
+    intervals = []  # (t0, t1, n1, dt, group_key, desc)
+    if edge_mode == "rise":
+        edges = [src_events[i] for i in range(1, len(src_events)) if src_events[i]["val"] > src_events[i - 1]["val"]]
+        for i in range(1, len(edges)):
+            t0, t1 = edges[i - 1]["t"], edges[i]["t"]
+            intervals.append((t0, t1, edges[i]["n"], max(0.0, t1 - t0), "rise", "上升緣週期"))
+    elif edge_mode == "fall":
+        edges = [src_events[i] for i in range(1, len(src_events)) if src_events[i]["val"] < src_events[i - 1]["val"]]
+        for i in range(1, len(edges)):
+            t0, t1 = edges[i - 1]["t"], edges[i]["t"]
+            intervals.append((t0, t1, edges[i]["n"], max(0.0, t1 - t0), "fall", "下降緣週期"))
+    elif edge_mode == "state":
+        for i in range(1, len(src_events)):
+            prev_ev = src_events[i - 1]
+            curr_ev = src_events[i]
+            g_key = str(prev_ev.get("val_str", prev_ev["val"]))
+            t0, t1 = prev_ev["t"], curr_ev["t"]
+            intervals.append((t0, t1, curr_ev["n"], max(0.0, t1 - t0), g_key, f"狀態 {g_key} 脈寬"))
+    else:
+        for i in range(1, len(src_events)):
+            t0, t1 = src_events[i - 1]["t"], src_events[i]["t"]
+            intervals.append((t0, t1, src_events[i]["n"], max(0.0, t1 - t0), "all", "事件間隔"))
+
+    groups = {}
+    for _, _, _, dt, g_key, _ in intervals:
+        groups.setdefault(g_key, []).append(dt)
+
+    has_explicit_target = (
+        params["period_s"] is not None
+        or params["min_s"] is not None
+        or params["max_s"] is not None
+    )
+    group_bounds = {}
+    for g_key, dts in groups.items():
+        med = _median_val(dts)
+        base, lo, hi = _compute_jitter_bounds(med, params)
+        can_flag = len(dts) >= 2 or has_explicit_target
+        group_bounds[g_key] = (base, lo, hi, can_flag)
+
+    period_series = []
+    anomalies = []
+    events = []
+
+    for t0, t1, n1, dt, g_key, desc in intervals:
+        base, lo, hi, can_flag = group_bounds[g_key]
+        is_short = can_flag and (dt < lo - 1e-12)
+        is_long = can_flag and (dt > hi + 1e-12)
+        is_anomaly = is_short or is_long
+        dt_ms = round(dt * 1000.0, 4)
+        hi_str = _fmt_ms_label(hi) if hi != float("inf") else "∞"
+
+        if is_anomaly:
+            diff_pct = ((dt - base) / base * 100.0) if base > 0 else 0.0
+            kind = "long" if is_long else "short"
+            tag = "過長" if is_long else "過短"
+            sign = "+" if diff_pct >= 0 else ""
+            info = (
+                f"[{tag} {sign}{diff_pct:.1f}%] {desc}={_fmt_ms_label(dt)} "
+                f"(基準 {_fmt_ms_label(base)}, 容許 {_fmt_ms_label(lo)}~{hi_str}) "
+                f"[{t0:.4f}s->{t1:.4f}s]"
+            )
+            anomalies.append(
+                {
+                    "t0": t0,
+                    "t1": t1,
+                    "n": n1,
+                    "dt_ms": dt_ms,
+                    "base_ms": round(base * 1000.0, 4),
+                    "diff_pct": round(diff_pct, 2),
+                    "kind": kind,
+                    "group": g_key,
+                    "info": info,
+                }
+            )
+            events.append(
+                {
+                    "t": t1,
+                    "n": n1,
+                    "proto": "JITTER",
+                    "info": info,
+                }
+            )
+        else:
+            info = f"{desc}={_fmt_ms_label(dt)} (基準 {_fmt_ms_label(base)}, 容許 {_fmt_ms_label(lo)}~{hi_str})"
+
+        period_series.append(
+            {
+                "t": t1,
+                "t0": t0,
+                "n": n1,
+                "val": dt_ms,
+                "val_str": _fmt_ms_label(dt),
+                "is_anomaly": is_anomaly,
+                "group": g_key,
+                "info": info,
+            }
+        )
+
+    target_ch = rule["target_ch"]
+    if target_ch is not None:
+        target_label = f"CH{target_ch + 1}"
+    else:
+        target_label = source_channel.get("loc_label") or (rule["target_filter"] or "")[:24]
+
+    base_ms = None
+    min_ms = None
+    max_ms = None
+    if len(group_bounds) == 1:
+        b, lo, hi, _ = next(iter(group_bounds.values()))
+        base_ms = round(b * 1000.0, 4)
+        min_ms = round(lo * 1000.0, 4)
+        max_ms = round(hi * 1000.0, 4) if hi != float("inf") else None
+
+    return {
+        "filter": raw_filter,
+        "error": None,
+        "events": events,
+        "is_jitter": True,
+        "target_ch": target_ch,
+        "anomalies": anomalies,
+        "period_series": period_series,
+        "loc_label": f"不規則週期 ({target_label})",
+        "dtype": "ms",
+        "jitter_meta": {
+            "edge_mode": edge_mode,
+            "total_cycles": len(period_series),
+            "anomaly_count": len(anomalies),
+            "base_ms": base_ms,
+            "min_ms": min_ms,
+            "max_ms": max_ms,
+            "target_label": target_label,
+        },
+    }
+
+
 def scan_channel(path, display_filter):
     display_filter = display_filter.replace("\x00", "").strip()
     if not display_filter:
@@ -1092,6 +1448,17 @@ def scan_channel(path, display_filter):
         return scan_ecat_pdo_channel(path, display_filter)
     if low.startswith("cdc:") or low.startswith("usb:"):
         return scan_usb_cdc_channel(path, display_filter)
+    if low.startswith("jitter:") or low.startswith("period:"):
+        try:
+            rule = parse_jitter_rule(display_filter)
+        except ValueError as exc:
+            return {"filter": display_filter, "error": str(exc), "events": []}
+        if rule["target_ch"] is not None:
+            return {"filter": display_filter, "error": "請透過完整掃描使用頻道參考 chN", "events": []}
+        src = scan_channel(path, rule["target_filter"])
+        if src.get("error"):
+            return {"filter": display_filter, "error": f"目標過濾錯誤: {src['error']}", "events": []}
+        return analyze_irregular_periods(src, rule, display_filter)
 
     try:
         proc = subprocess.run(
@@ -1159,8 +1526,50 @@ def scan_channel(path, display_filter):
 def scan_all(path, filters):
     padded = list(filters[:CHANNEL_COUNT])
     padded.extend([""] * (CHANNEL_COUNT - len(padded)))
+
+    pass1_inputs = list(padded)
+    pass2_refs = {}
+    pass2_errors = {}
+    for index, raw_f in enumerate(padded):
+        clean = raw_f.replace("\x00", "").strip() if isinstance(raw_f, str) else ""
+        low = clean.lower()
+        if low.startswith("jitter:") or low.startswith("period:"):
+            if len(clean) > 1000:
+                pass2_errors[index] = {"filter": clean, "error": "過濾指令過長", "events": []}
+                pass1_inputs[index] = ""
+                continue
+            try:
+                rule = parse_jitter_rule(clean)
+            except ValueError as exc:
+                pass2_errors[index] = {"filter": clean, "error": str(exc), "events": []}
+                pass1_inputs[index] = ""
+                continue
+            if rule["target_ch"] is not None:
+                pass2_refs[index] = (clean, rule)
+                pass1_inputs[index] = ""
+
     with ThreadPoolExecutor(max_workers=8) as pool:
-        channels = list(pool.map(lambda item: scan_channel(path, item), padded))
+        channels = list(pool.map(lambda item: scan_channel(path, item), pass1_inputs))
+
+    for index, err_res in pass2_errors.items():
+        channels[index] = err_res
+
+    for index, (clean, rule) in pass2_refs.items():
+        t_ch = rule["target_ch"]
+        if t_ch == index:
+            channels[index] = {"filter": clean, "error": "不可參考自身頻道", "events": []}
+            continue
+        if not padded[t_ch].strip():
+            channels[index] = {"filter": clean, "error": f"CH{t_ch + 1} 尚未設定過濾條件", "events": []}
+            continue
+        if t_ch in pass2_refs or t_ch in pass2_errors or channels[t_ch].get("is_jitter"):
+            channels[index] = {"filter": clean, "error": "不可連鎖參考另一個週期偵測頻道", "events": []}
+            continue
+        src_err = channels[t_ch].get("error")
+        if src_err:
+            channels[index] = {"filter": clean, "error": f"參考頻道 CH{t_ch + 1} 過濾錯誤: {src_err}", "events": []}
+            continue
+        channels[index] = analyze_irregular_periods(channels[t_ch], rule, clean)
 
     max_t = 0.0
     total_events = 0
@@ -1170,6 +1579,9 @@ def scan_all(path, filters):
         total_events += len(evs)
         if evs and evs[-1]["t"] > max_t:
             max_t = evs[-1]["t"]
+        p_series = channel.get("period_series")
+        if p_series and p_series[-1]["t"] > max_t:
+            max_t = p_series[-1]["t"]
 
     meta = capture_meta(path, fallback_duration=max_t if max_t > 0 else 1.0)
     if meta["packets"] == 0 and total_events > 0:
@@ -1188,7 +1600,7 @@ LIVE_UI_INJECTION = """
     </select>
     <button id="live-toggle-btn" style="background:#10b981;color:#fff;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-weight:bold;">開始即時監控</button>
     <span id="live-status" style="color:#94a3b8;">待機中</span>
-    <button id="pdo-helper-toggle" style="margin-left:auto;background:#0284c7;color:#fff;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-weight:bold;">📈 波形與切幀規則產生器 (PDO / USB CDC)</button>
+    <button id="pdo-helper-toggle" style="margin-left:auto;background:#0284c7;color:#fff;border:none;padding:5px 12px;border-radius:4px;cursor:pointer;font-weight:bold;">📈 波形與規則產生器 (PDO / USB CDC / 週期異常)</button>
   </div>
 
   <div id="pdo-helper-panel" style="display:none;margin-top:10px;padding-top:10px;border-top:1px dashed #475569;align-items:center;gap:8px;flex-wrap:wrap;">
@@ -1198,11 +1610,12 @@ LIVE_UI_INJECTION = """
         <option value="pdo" selected>EtherCAT PDO (pdo:)</option>
         <option value="cdc">USB CDC 串流重組 (cdc:)</option>
         <option value="usb">USB 逐包解析 (usb:)</option>
+        <option value="jitter">不規則週期偵測 (jitter:)</option>
       </select>
     </label>
     <input id="pdo-base" type="text" value="ecat" placeholder="基礎過濾 (如 ecat.ado == 0x1000 或 usb.capdata)" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px 8px;border-radius:4px;width:230px;">
     <label id="pdo-byte-wrap">Byte 起始:<input id="pdo-byte" type="number" min="0" value="0" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px;border-radius:4px;width:55px;margin-left:4px;"></label>
-    <label>資料格式:
+    <label id="pdo-dtype-wrap">資料格式:
       <select id="pdo-dtype" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px;border-radius:4px;margin-left:4px;">
         <option value="frame">frame (僅重組封包脈衝)</option>
         <option value="bit">bit (單一 Bit 0/1)</option>
@@ -1246,6 +1659,33 @@ LIVE_UI_INJECTION = """
       </label>
       <label>擷取欄位:<input id="cdc-field" type="text" value="usb.capdata" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px 6px;border-radius:4px;width:95px;margin-left:4px;"></label>
     </div>
+
+    <div id="jitter-config-row" style="display:none;width:100%;padding-top:8px;border-top:1px dashed #334155;align-items:center;gap:8px;flex-wrap:wrap;">
+      <span style="color:#f87171;font-weight:bold;">不規則週期偵測：</span>
+      <label>目標來源:
+        <select id="jitter-target" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px;border-radius:4px;margin-left:4px;">
+          <option value="ch1">CH1</option><option value="ch2">CH2</option><option value="ch3" selected>CH3</option><option value="ch4">CH4</option>
+          <option value="ch5">CH5</option><option value="ch6">CH6</option><option value="ch7">CH7</option><option value="ch8">CH8</option>
+          <option value="ch9">CH9</option><option value="ch10">CH10</option><option value="ch11">CH11</option><option value="ch12">CH12</option>
+          <option value="ch13">CH13</option><option value="ch14">CH14</option><option value="ch15">CH15</option><option value="ch16">CH16</option>
+          <option value="ch17">CH17</option><option value="ch18">CH18</option><option value="ch19">CH19</option><option value="ch20">CH20</option>
+          <option value="custom">自訂過濾條件</option>
+        </select>
+      </label>
+      <label>週期模式:
+        <select id="jitter-edge" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px;border-radius:4px;margin-left:4px;">
+          <option value="auto" selected>自動 (auto)</option>
+          <option value="rise">上升緣週期 (rise)</option>
+          <option value="fall">下降緣週期 (fall)</option>
+          <option value="state">各狀態脈寬 (state)</option>
+          <option value="all">相鄰事件間隔 (all)</option>
+        </select>
+      </label>
+      <label>容許誤差:<input id="jitter-tol" type="text" value="20%" placeholder="如 20% 或 5ms" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px 6px;border-radius:4px;width:85px;margin-left:4px;"></label>
+      <label>目標週期(ms):<input id="jitter-period" type="text" placeholder="自動(中位數)" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px 6px;border-radius:4px;width:95px;margin-left:4px;"></label>
+      <label>下限(ms):<input id="jitter-min" type="text" placeholder="選填" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px 6px;border-radius:4px;width:65px;margin-left:4px;"></label>
+      <label>上限(ms):<input id="jitter-max" type="text" placeholder="選填" style="background:#0f172a;color:#f8fafc;border:1px solid #475569;padding:4px 6px;border-radius:4px;width:65px;margin-left:4px;"></label>
+    </div>
   </div>
 </div>
 
@@ -1281,6 +1721,7 @@ LIVE_UI_INJECTION = """
   const pdoBase = document.getElementById('pdo-base');
   const pdoByteWrap = document.getElementById('pdo-byte-wrap');
   const pdoByte = document.getElementById('pdo-byte');
+  const pdoDtypeWrap = document.getElementById('pdo-dtype-wrap');
   const pdoDtype = document.getElementById('pdo-dtype');
   const pdoBitWrap = document.getElementById('pdo-bit-wrap');
   const pdoBit = document.getElementById('pdo-bit');
@@ -1300,6 +1741,13 @@ LIVE_UI_INJECTION = """
   const cdcMatch = document.getElementById('cdc-match');
   const cdcTs = document.getElementById('cdc-ts');
   const cdcField = document.getElementById('cdc-field');
+  const jitterConfigRow = document.getElementById('jitter-config-row');
+  const jitterTarget = document.getElementById('jitter-target');
+  const jitterEdge = document.getElementById('jitter-edge');
+  const jitterTol = document.getElementById('jitter-tol');
+  const jitterPeriod = document.getElementById('jitter-period');
+  const jitterMin = document.getElementById('jitter-min');
+  const jitterMax = document.getElementById('jitter-max');
   const pdoCopyBtn = document.getElementById('pdo-copy-btn');
   const pdoPreview = document.getElementById('pdo-preview');
 
@@ -1479,7 +1927,7 @@ LIVE_UI_INJECTION = """
   }
 
   function computePdoMeasureStats(ch, m) {
-    const events = ch.events || [];
+    const events = (ch.is_jitter ? ch.period_series : ch.events) || [];
     const t0 = m.t0;
     const t1 = m.t1;
     const dt = Math.max(0, t1 - t0);
@@ -1654,8 +2102,8 @@ LIVE_UI_INJECTION = """
   }
 
   function drawPdoRow(row) {
-    const { ch, color, canvas, canvasWrap, minVal, maxVal } = row;
-    const events = ch.events;
+    const { ch, color, canvas, canvasWrap, minVal, maxVal, anomalies } = row;
+    const events = ch.events || [];
     const rect = canvasWrap.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
     const w = Math.max(rect.width, 300);
@@ -1709,53 +2157,162 @@ LIVE_UI_INJECTION = """
     ctx.fillText(formatAxisNum(maxVal, ch.dtype), 4, padTop - 4);
     ctx.fillText(formatAxisNum(minVal, ch.dtype), 4, h - 4);
 
-    // 繪製階梯波形 (Step Waveform，支援縮放/平移視窗裁剪)
-    if (events.length > 0 && events[0].t <= pdoView.t1) {
-      let startIdx = 0;
-      for (let i = 0; i < events.length; i++) {
-        if (events[i].t <= pdoView.t0) startIdx = i;
-        else break;
+    if (ch.is_jitter) {
+      const jm = ch.jitter_meta || {};
+      const series = ch.period_series || [];
+
+      if (jm.min_ms != null && jm.max_ms != null) {
+        const yTop = Math.max(padTop, Math.min(padTop + plotH, valToY(jm.max_ms)));
+        const yBot = Math.max(padTop, Math.min(padTop + plotH, valToY(jm.min_ms)));
+        if (yBot > yTop) {
+          ctx.fillStyle = 'rgba(16, 185, 129, 0.10)';
+          ctx.fillRect(0, yTop, w, yBot - yTop);
+        }
+        ctx.save();
+        ctx.strokeStyle = 'rgba(16, 185, 129, 0.55)';
+        ctx.setLineDash([4, 4]);
+        ctx.lineWidth = 1;
+        [jm.min_ms, jm.max_ms].forEach(lim => {
+          const ly = valToY(lim);
+          if (ly >= padTop - 2 && ly <= padTop + plotH + 2) {
+            ctx.beginPath();
+            ctx.moveTo(0, ly);
+            ctx.lineTo(w, ly);
+            ctx.stroke();
+          }
+        });
+        ctx.restore();
+      } else if (jm.base_ms != null) {
+        const by = valToY(jm.base_ms);
+        if (by >= padTop && by <= padTop + plotH) {
+          ctx.save();
+          ctx.strokeStyle = 'rgba(16, 185, 129, 0.55)';
+          ctx.setLineDash([4, 4]);
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(0, by);
+          ctx.lineTo(w, by);
+          ctx.stroke();
+          ctx.restore();
+        }
       }
 
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-
-      let prevX = pdoTimeToX(Math.max(events[startIdx].t, pdoView.t0), w);
-      let prevY = valToY(events[startIdx].val);
-      ctx.moveTo(prevX, prevY);
-
-      for (let i = startIdx + 1; i < events.length; i++) {
-        if (events[i].t > pdoView.t1) break;
-        const currX = pdoTimeToX(events[i].t, w);
-        const currY = valToY(events[i].val);
-        ctx.lineTo(currX, prevY);
-        ctx.lineTo(currX, currY);
-        prevX = currX;
-        prevY = currY;
+      if (ch.anomalies && ch.anomalies.length > 0) {
+        for (const a of ch.anomalies) {
+          if (a.t1 < pdoView.t0 || a.t0 > pdoView.t1) continue;
+          const ax0 = Math.max(0, pdoTimeToX(a.t0, w));
+          const ax1 = Math.min(w, pdoTimeToX(a.t1, w));
+          ctx.fillStyle = 'rgba(239, 68, 68, 0.18)';
+          ctx.fillRect(ax0, 0, Math.max(2, ax1 - ax0), h);
+          ctx.fillStyle = '#ef4444';
+          ctx.fillRect(ax0, 0, Math.max(2, ax1 - ax0), 3);
+        }
       }
-      ctx.lineTo(pdoTimeToX(pdoView.t1, w), prevY);
-      ctx.stroke();
 
-      // 在每次數值變化的轉折點畫上小圓點並標註數值
-      ctx.fillStyle = color;
-      let lastLabelX = -999;
-      for (let i = 0; i < events.length; i++) {
-        if (events[i].is_hold) continue;
-        if (events[i].t < pdoView.t0 || events[i].t > pdoView.t1) continue;
-        const px = pdoTimeToX(events[i].t, w);
-        const py = valToY(events[i].val);
+      if (series.length > 0) {
+        let startIdx = 0;
+        for (let i = 0; i < series.length; i++) {
+          if (series[i].t < pdoView.t0) startIdx = i;
+          else break;
+        }
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.6;
         ctx.beginPath();
-        ctx.arc(px, py, 3, 0, Math.PI * 2);
-        ctx.fill();
+        let started = false;
+        for (let i = startIdx; i < series.length; i++) {
+          const px = pdoTimeToX(series[i].t, w);
+          const py = valToY(series[i].val);
+          if (!started) {
+            ctx.moveTo(px, py);
+            started = true;
+          } else {
+            ctx.lineTo(px, py);
+          }
+          if (series[i].t > pdoView.t1) break;
+        }
+        ctx.stroke();
 
-        if (px - lastLabelX > 48) {
-          ctx.fillStyle = '#f8fafc';
-          ctx.font = '11px monospace';
-          const textY = py < h / 2 ? py + 13 : py - 5;
-          ctx.fillText(events[i].val_str, px + 4, textY);
-          ctx.fillStyle = color;
-          lastLabelX = px;
+        let lastLabelX = -999;
+        for (let i = 0; i < series.length; i++) {
+          const pt = series[i];
+          if (pt.t < pdoView.t0 || pt.t > pdoView.t1) continue;
+          const px = pdoTimeToX(pt.t, w);
+          const py = valToY(pt.val);
+          ctx.fillStyle = pt.is_anomaly ? '#ef4444' : color;
+          ctx.beginPath();
+          ctx.arc(px, py, pt.is_anomaly ? 4 : 2.2, 0, Math.PI * 2);
+          ctx.fill();
+          if (pt.is_anomaly && px - lastLabelX > 48) {
+            ctx.fillStyle = '#fecaca';
+            ctx.font = '11px monospace';
+            const textY = py < h / 2 ? py + 13 : py - 5;
+            ctx.fillText(pt.val_str, px + 4, textY);
+            lastLabelX = px;
+          }
+        }
+      }
+    } else {
+      // 標記目標頻道上的週期異常紅色區間
+      if (anomalies && anomalies.length > 0) {
+        for (const a of anomalies) {
+          if (a.t1 < pdoView.t0 || a.t0 > pdoView.t1) continue;
+          const ax0 = Math.max(0, pdoTimeToX(a.t0, w));
+          const ax1 = Math.min(w, pdoTimeToX(a.t1, w));
+          ctx.fillStyle = 'rgba(239, 68, 68, 0.20)';
+          ctx.fillRect(ax0, 0, Math.max(2, ax1 - ax0), h);
+          ctx.fillStyle = '#ef4444';
+          ctx.fillRect(ax0, 0, Math.max(2, ax1 - ax0), 3);
+        }
+      }
+
+      // 繪製階梯波形 (Step Waveform，支援縮放/平移視窗裁剪)
+      if (events.length > 0 && events[0].t <= pdoView.t1) {
+        let startIdx = 0;
+        for (let i = 0; i < events.length; i++) {
+          if (events[i].t <= pdoView.t0) startIdx = i;
+          else break;
+        }
+
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+
+        let prevX = pdoTimeToX(Math.max(events[startIdx].t, pdoView.t0), w);
+        let prevY = valToY(events[startIdx].val);
+        ctx.moveTo(prevX, prevY);
+
+        for (let i = startIdx + 1; i < events.length; i++) {
+          if (events[i].t > pdoView.t1) break;
+          const currX = pdoTimeToX(events[i].t, w);
+          const currY = valToY(events[i].val);
+          ctx.lineTo(currX, prevY);
+          ctx.lineTo(currX, currY);
+          prevX = currX;
+          prevY = currY;
+        }
+        ctx.lineTo(pdoTimeToX(pdoView.t1, w), prevY);
+        ctx.stroke();
+
+        // 在每次數值變化的轉折點畫上小圓點並標註數值
+        ctx.fillStyle = color;
+        let lastLabelX = -999;
+        for (let i = 0; i < events.length; i++) {
+          if (events[i].is_hold) continue;
+          if (events[i].t < pdoView.t0 || events[i].t > pdoView.t1) continue;
+          const px = pdoTimeToX(events[i].t, w);
+          const py = valToY(events[i].val);
+          ctx.beginPath();
+          ctx.arc(px, py, 3, 0, Math.PI * 2);
+          ctx.fill();
+
+          if (px - lastLabelX > 48) {
+            ctx.fillStyle = '#f8fafc';
+            ctx.font = '11px monospace';
+            const textY = py < h / 2 ? py + 13 : py - 5;
+            ctx.fillText(events[i].val_str, px + 4, textY);
+            ctx.fillStyle = color;
+            lastLabelX = px;
+          }
         }
       }
     }
@@ -1843,8 +2400,19 @@ LIVE_UI_INJECTION = """
   }
 
   function renderPdoWaveforms(data) {
-    const pdoChannels = data.channels.filter(ch => ch.is_pdo && !ch.error && ch.events && ch.events.length > 0);
-    if (pdoChannels.length === 0) {
+    const targetAnomalies = {};
+    data.channels.forEach((ch) => {
+      if (ch.is_jitter && !ch.error && ch.target_ch != null && Array.isArray(ch.anomalies) && ch.anomalies.length > 0) {
+        if (!targetAnomalies[ch.target_ch]) targetAnomalies[ch.target_ch] = [];
+        targetAnomalies[ch.target_ch].push(...ch.anomalies);
+      }
+    });
+
+    const scopeChannels = data.channels.filter(
+      ch => (ch.is_pdo && !ch.error && ch.events && ch.events.length > 0)
+         || (ch.is_jitter && !ch.error && ch.period_series && ch.period_series.length > 0)
+    );
+    if (scopeChannels.length === 0) {
       scopeDock.style.display = 'none';
       pdoRowModels = [];
       hidePdoMeasureTooltip();
@@ -1876,10 +2444,15 @@ LIVE_UI_INJECTION = """
 
     pdoRowModels = [];
 
-    pdoChannels.forEach((ch) => {
+    scopeChannels.forEach((ch) => {
       const color = CHANNEL_COLORS[ch.index % CHANNEL_COLORS.length];
-      const events = ch.events;
+      const events = ch.is_jitter ? ch.period_series : ch.events;
       const vals = events.map(e => e.val);
+      const jm = ch.jitter_meta || {};
+      if (ch.is_jitter) {
+        if (jm.min_ms != null) vals.push(jm.min_ms);
+        if (jm.max_ms != null) vals.push(jm.max_ms);
+      }
       let minVal = Math.min(...vals);
       let maxVal = Math.max(...vals);
 
@@ -1889,6 +2462,10 @@ LIVE_UI_INJECTION = """
       } else if (minVal === maxVal) {
         minVal = minVal - 1;
         maxVal = maxVal + 1;
+      } else if (ch.is_jitter) {
+        const spanPad = (maxVal - minVal) * 0.1;
+        minVal = Math.max(0, minVal - spanPad);
+        maxVal = maxVal + spanPad;
       }
 
       const row = document.createElement('div');
@@ -1897,22 +2474,70 @@ LIVE_UI_INJECTION = """
       // 左側資訊與 Y 軸最大/最小值標籤
       const sidebar = document.createElement('div');
       sidebar.style.cssText = 'width:215px;flex-shrink:0;padding:6px 10px;border-right:1px solid #1e293b;display:flex;flex-direction:column;justify-content:space-between;background:#131c31;';
-      const latestEv = events[events.length - 1];
-      sidebar.innerHTML = `
-        <div style="display:flex;align-items:center;justify-content:space-between;">
-          <span style="font-weight:bold;color:${color};font-size:12px;">CH${ch.index + 1} · ${ch.loc_label || 'PDO'}</span>
-          <span style="font-size:11px;color:#94a3b8;background:#1e293b;padding:1px 5px;border-radius:3px;">${ch.dtype}</span>
-        </div>
-        <div style="font-family:monospace;font-size:14px;font-weight:bold;color:#f8fafc;">
-          目前: ${latestEv ? latestEv.val_str : '-'}
-        </div>
-        <div style="display:flex;justify-content:space-between;font-family:monospace;font-size:11px;color:#94a3b8;">
-          <span>Min: ${formatAxisNum(minVal, ch.dtype)}</span>
-          <span>Max: ${formatAxisNum(maxVal, ch.dtype)}</span>
-        </div>
-      `;
 
-      // 右側 Canvas 階梯波形區
+      if (ch.is_jitter) {
+        const anomCnt = jm.anomaly_count || 0;
+        const totalCyc = jm.total_cycles || 0;
+        const anomColor = anomCnt > 0 ? '#f87171' : '#4ade80';
+        const baseText = jm.base_ms != null ? `${jm.base_ms.toFixed(2)} ms` : '依狀態';
+        const jumpBtns = anomCnt > 0
+          ? '<span style="display:inline-flex;gap:3px;"><button type="button" class="jitter-jump-prev" title="跳至上一處異常" style="background:#1e293b;color:#fca5a5;border:1px solid #7f1d1d;border-radius:3px;padding:0 5px;cursor:pointer;font-size:11px;">◀</button><button type="button" class="jitter-jump-next" title="跳至下一處異常" style="background:#1e293b;color:#fca5a5;border:1px solid #7f1d1d;border-radius:3px;padding:0 5px;cursor:pointer;font-size:11px;">▶</button></span>'
+          : '';
+        sidebar.innerHTML = `
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:4px;">
+            <span style="font-weight:bold;color:${color};font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">CH${ch.index + 1} · ${ch.loc_label || '週期'}</span>
+            <span style="font-size:10px;color:#94a3b8;background:#1e293b;padding:1px 5px;border-radius:3px;flex-shrink:0;">jitter (${jm.edge_mode || 'auto'})</span>
+          </div>
+          <div style="display:flex;align-items:center;justify-content:space-between;font-family:monospace;font-size:13px;font-weight:bold;color:${anomColor};">
+            <span>異常: ${anomCnt} / ${totalCyc}</span>
+            ${jumpBtns}
+          </div>
+          <div style="display:flex;justify-content:space-between;font-family:monospace;font-size:11px;color:#94a3b8;">
+            <span>基準: ${baseText}</span>
+            <span>${formatAxisNum(minVal, ch.dtype)}~${formatAxisNum(maxVal, ch.dtype)}ms</span>
+          </div>
+        `;
+        let jumpIdx = -1;
+        const doJump = (delta) => {
+          const list = ch.anomalies || [];
+          if (list.length === 0) return;
+          jumpIdx = jumpIdx === -1 ? (delta > 0 ? 0 : list.length - 1) : (jumpIdx + delta + list.length) % list.length;
+          const a = list[jumpIdx];
+          const span = Math.max(a.t1 - a.t0, 1e-4);
+          const pad = Math.max(span * 2, 0.05);
+          let t0 = Math.max(0, a.t0 - pad);
+          let t1 = Math.min(pdoDuration, a.t1 + pad);
+          if (t1 - t0 < 20e-6) t1 = Math.min(pdoDuration, t0 + 20e-6);
+          pdoView = { t0, t1 };
+          pdoCursorT = a.t1;
+          cursorReadout.textContent = `⚠ [${jumpIdx + 1}/${list.length}] ${a.info}`;
+          drawPdoAll();
+        };
+        const prevBtn = sidebar.querySelector('.jitter-jump-prev');
+        const nextBtn = sidebar.querySelector('.jitter-jump-next');
+        if (prevBtn) prevBtn.addEventListener('click', () => doJump(-1));
+        if (nextBtn) nextBtn.addEventListener('click', () => doJump(1));
+      } else {
+        const latestEv = events[events.length - 1];
+        const anomList = targetAnomalies[ch.index] || [];
+        const anomTag = anomList.length > 0 ? `<span style="color:#f87171;font-size:11px;">⚠${anomList.length}</span>` : '';
+        sidebar.innerHTML = `
+          <div style="display:flex;align-items:center;justify-content:space-between;">
+            <span style="font-weight:bold;color:${color};font-size:12px;">CH${ch.index + 1} · ${ch.loc_label || 'PDO'}</span>
+            <span style="font-size:11px;color:#94a3b8;background:#1e293b;padding:1px 5px;border-radius:3px;">${ch.dtype}</span>
+          </div>
+          <div style="display:flex;align-items:center;justify-content:space-between;font-family:monospace;font-size:14px;font-weight:bold;color:#f8fafc;">
+            <span>目前: ${latestEv ? latestEv.val_str : '-'}</span>
+            ${anomTag}
+          </div>
+          <div style="display:flex;justify-content:space-between;font-family:monospace;font-size:11px;color:#94a3b8;">
+            <span>Min: ${formatAxisNum(minVal, ch.dtype)}</span>
+            <span>Max: ${formatAxisNum(maxVal, ch.dtype)}</span>
+          </div>
+        `;
+      }
+
+      // 右側 Canvas 波形區
       const canvasWrap = document.createElement('div');
       canvasWrap.style.cssText = 'flex:1;position:relative;cursor:crosshair;';
       const canvas = document.createElement('canvas');
@@ -1923,7 +2548,15 @@ LIVE_UI_INJECTION = """
       row.appendChild(canvasWrap);
       waveformsContainer.appendChild(row);
 
-      const rowModel = { ch, color, canvas, canvasWrap, minVal, maxVal };
+      const rowModel = {
+        ch,
+        color,
+        canvas,
+        canvasWrap,
+        minVal,
+        maxVal,
+        anomalies: ch.is_jitter ? (ch.anomalies || []) : (targetAnomalies[ch.index] || []),
+      };
       pdoRowModels.push(rowModel);
 
       canvasWrap.addEventListener('wheel', (e) => {
@@ -1993,13 +2626,32 @@ LIVE_UI_INJECTION = """
 
         const hoverT = Math.min(pdoView.t1, Math.max(pdoView.t0, pdoXToTime(x, w)));
         pdoCursorT = hoverT;
-        let activeEv = events[0];
-        for (let i = 0; i < events.length; i++) {
-          if (events[i].t <= hoverT) activeEv = events[i];
-          else break;
-        }
-        if (activeEv) {
-          cursorReadout.textContent = `時間: ${pdoFmtTime(hoverT)} (${hoverT.toFixed(6)}s) | CH${ch.index + 1} (${ch.loc_label}) 數值 = ${activeEv.val_str} (Frame #${activeEv.n})`;
+        if (ch.is_jitter) {
+          let activePt = events.find(pt => pt.t0 <= hoverT && hoverT <= pt.t);
+          if (!activePt) {
+            let bestDist = Infinity;
+            for (const pt of events) {
+              const d = Math.abs(pt.t - hoverT);
+              if (d < bestDist) {
+                bestDist = d;
+                activePt = pt;
+              }
+            }
+          }
+          if (activePt) {
+            cursorReadout.textContent = `時間: ${pdoFmtTime(hoverT)} (${hoverT.toFixed(6)}s) | CH${ch.index + 1} (${ch.loc_label}) ${activePt.info} (Frame #${activePt.n})`;
+          }
+        } else {
+          let activeEv = events[0];
+          for (let i = 0; i < events.length; i++) {
+            if (events[i].t <= hoverT) activeEv = events[i];
+            else break;
+          }
+          if (activeEv) {
+            const anom = rowModel.anomalies.find(a => a.t0 <= hoverT && hoverT <= a.t1);
+            const anomNote = anom ? ` | ⚠ ${anom.info}` : '';
+            cursorReadout.textContent = `時間: ${pdoFmtTime(hoverT)} (${hoverT.toFixed(6)}s) | CH${ch.index + 1} (${ch.loc_label}) 數值 = ${activeEv.val_str} (Frame #${activeEv.n})${anomNote}`;
+          }
         }
 
         const hit = findPdoMeasureAt(x, y, w);
@@ -2119,6 +2771,12 @@ LIVE_UI_INJECTION = """
         match: cdcMatch.value,
         ts: cdcTs.value,
         field: cdcField.value,
+        jitterTarget: jitterTarget.value,
+        jitterEdge: jitterEdge.value,
+        jitterTol: jitterTol.value,
+        jitterPeriod: jitterPeriod.value,
+        jitterMin: jitterMin.value,
+        jitterMax: jitterMax.value,
       }));
     } catch (e) {}
   }
@@ -2127,7 +2785,7 @@ LIVE_UI_INJECTION = """
     try {
       const saved = JSON.parse(localStorage.getItem(CDC_STORAGE_KEY) || 'null');
       if (!saved || typeof saved !== 'object') return;
-      if (saved.mode && ['pdo', 'cdc', 'usb'].includes(saved.mode)) pdoMode.value = saved.mode;
+      if (saved.mode && ['pdo', 'cdc', 'usb', 'jitter'].includes(saved.mode)) pdoMode.value = saved.mode;
       if (typeof saved.base === 'string' && saved.base.trim()) pdoBase.value = saved.base;
       if (saved.endian && ['le', 'be'].includes(saved.endian)) cdcEndian.value = saved.endian;
       if (typeof saved.head === 'string') cdcHead.value = saved.head;
@@ -2139,6 +2797,12 @@ LIVE_UI_INJECTION = """
       if (typeof saved.match === 'string') cdcMatch.value = saved.match;
       if (saved.ts && ['start', 'end'].includes(saved.ts)) cdcTs.value = saved.ts;
       if (typeof saved.field === 'string' && saved.field.trim()) cdcField.value = saved.field;
+      if (typeof saved.jitterTarget === 'string') jitterTarget.value = saved.jitterTarget;
+      if (saved.jitterEdge && ['auto', 'rise', 'fall', 'state', 'all'].includes(saved.jitterEdge)) jitterEdge.value = saved.jitterEdge;
+      if (typeof saved.jitterTol === 'string') jitterTol.value = saved.jitterTol;
+      if (typeof saved.jitterPeriod === 'string') jitterPeriod.value = saved.jitterPeriod;
+      if (typeof saved.jitterMin === 'string') jitterMin.value = saved.jitterMin;
+      if (typeof saved.jitterMax === 'string') jitterMax.value = saved.jitterMax;
     } catch (e) {}
   }
 
@@ -2167,8 +2831,32 @@ LIVE_UI_INJECTION = """
     return segs.length > 0 ? segs.join(',') : 'none';
   }
 
+  function buildJitterParamsSpec() {
+    const segs = [];
+    const period = jitterPeriod.value.trim();
+    const tol = jitterTol.value.trim();
+    const minV = jitterMin.value.trim();
+    const maxV = jitterMax.value.trim();
+    const edge = jitterEdge.value;
+    if (period) segs.push(`period=${period}`);
+    if (tol) segs.push(`tol=${tol}`);
+    if (minV) segs.push(`min=${minV}`);
+    if (maxV) segs.push(`max=${maxV}`);
+    if (edge && edge !== 'auto') segs.push(`edge=${edge}`);
+    return segs.join(',');
+  }
+
   function buildPdoSyntax() {
     const mode = pdoMode.value;
+    if (mode === 'jitter') {
+      const target = jitterTarget.value;
+      const params = buildJitterParamsSpec();
+      if (target !== 'custom') {
+        return params ? `jitter: ${target} | ${params}` : `jitter: ${target}`;
+      }
+      const base = pdoBase.value.trim() || 'ecat';
+      return `jitter: ${params || 'tol=20%'} | ${base}`;
+    }
     const defaultBase = mode === 'pdo' ? 'ecat' : (cdcField.value.trim() || 'usb.capdata');
     const base = pdoBase.value.trim() || defaultBase;
     const byteIdx = parseInt(pdoByte.value || '0', 10);
@@ -2198,6 +2886,7 @@ LIVE_UI_INJECTION = """
 
   function updatePdoPreview() {
     const mode = pdoMode.value;
+    const isJitter = mode === 'jitter';
     const frameOpt = pdoDtype.querySelector('option[value="frame"]');
     if (frameOpt) {
       frameOpt.hidden = mode === 'pdo';
@@ -2207,12 +2896,15 @@ LIVE_UI_INJECTION = """
       pdoDtype.value = 'uint16';
     }
     const dtype = pdoDtype.value;
+    pdoBase.style.display = (isJitter && jitterTarget.value !== 'custom') ? 'none' : '';
     cdcFramingRow.style.display = mode === 'cdc' ? 'flex' : 'none';
+    jitterConfigRow.style.display = isJitter ? 'flex' : 'none';
+    pdoDtypeWrap.style.display = isJitter ? 'none' : 'inline-block';
     pdoDgWrap.style.display = mode === 'pdo' ? 'inline-block' : 'none';
-    cdcEndianWrap.style.display = (mode !== 'pdo' && dtype !== 'frame' && dtype !== 'bit') ? 'inline-block' : 'none';
-    pdoByteWrap.style.display = dtype === 'frame' ? 'none' : 'inline-block';
-    pdoBitWrap.style.display = dtype === 'bit' ? 'inline-block' : 'none';
-    pdoLenWrap.style.display = dtype === 'hex' ? 'inline-block' : 'none';
+    cdcEndianWrap.style.display = (!isJitter && mode !== 'pdo' && dtype !== 'frame' && dtype !== 'bit') ? 'inline-block' : 'none';
+    pdoByteWrap.style.display = (isJitter || dtype === 'frame') ? 'none' : 'inline-block';
+    pdoBitWrap.style.display = (!isJitter && dtype === 'bit') ? 'inline-block' : 'none';
+    pdoLenWrap.style.display = (!isJitter && dtype === 'hex') ? 'inline-block' : 'none';
     pdoPreview.textContent = buildPdoSyntax();
     saveCdcSettings();
   }
@@ -2221,8 +2913,20 @@ LIVE_UI_INJECTION = """
     const curBase = pdoBase.value.trim();
     if (pdoMode.value === 'pdo') {
       if (!curBase || curBase === 'usb.capdata') pdoBase.value = 'ecat';
-    } else {
+    } else if (pdoMode.value === 'cdc' || pdoMode.value === 'usb') {
       if (!curBase || curBase === 'ecat') pdoBase.value = 'usb.capdata';
+    } else if (pdoMode.value === 'jitter') {
+      const inputs = getChannelFilterInputs();
+      let pick = inputs.findIndex(i => {
+        const v = i.value.trim().toLowerCase();
+        return v.startsWith('cdc:') || v.startsWith('pdo:') || v.startsWith('usb:');
+      });
+      if (pick === -1) {
+        pick = inputs.findIndex(i => i.value.trim() && !i.value.trim().toLowerCase().startsWith('jitter:') && !i.value.trim().toLowerCase().startsWith('period:'));
+      }
+      if (pick >= 0) {
+        jitterTarget.value = 'ch' + (pick + 1);
+      }
     }
     updatePdoPreview();
   });
@@ -2241,6 +2945,7 @@ LIVE_UI_INJECTION = """
   [
     pdoBase, pdoByte, pdoDtype, pdoBit, pdoLen, pdoDg,
     cdcEndian, cdcHead, cdcTail, cdcLen, cdcLenOff, cdcLenBias, cdcGap, cdcMatch, cdcTs, cdcField,
+    jitterTarget, jitterEdge, jitterTol, jitterPeriod, jitterMin, jitterMax,
   ].forEach(el => {
     el.addEventListener('input', updatePdoPreview);
     el.addEventListener('change', updatePdoPreview);
